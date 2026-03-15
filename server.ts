@@ -202,7 +202,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("settings").select("*");
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -212,7 +212,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("categories").select("*").eq("active", true).order("order_index");
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -222,7 +222,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("subcategories").select("*").eq("category_id", req.params.id).eq("active", true).order("order_index");
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -232,7 +232,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("subcategories").select("*").eq("active", true).order("order_index");
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -242,7 +242,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("products").select("*").eq("subcategory_id", req.params.id).eq("available", true);
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -252,7 +252,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("sub_sub_categories").select("*").eq("subcategory_id", req.params.id).eq("active", true).order("order_index");
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -262,7 +262,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("sub_sub_categories").select("*").eq("active", true).order("order_index");
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -272,7 +272,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("products").select("*").eq("sub_sub_category_id", req.params.id).eq("available", true);
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -282,7 +282,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("banners").select("*").order("order_index");
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -292,7 +292,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("offers").select("*").eq("active", true).order("created_at", { ascending: false });
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -302,7 +302,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("payment_methods").select("*").eq("active", true);
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -471,9 +471,9 @@ async function startServer() {
         .or(`user_id.eq.${req.params.userId},user_id.is.null`)
         .order("created_at", { ascending: false });
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.json([]); // always array
     }
   });
 
@@ -569,9 +569,9 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("orders").select("*, order_items(*)").eq("user_id", req.params.userId).order("created_at", { ascending: false });
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.json([]); // safe fallback
     }
   });
 
@@ -622,9 +622,9 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("transactions").select("*").eq("user_id", req.params.userId).order("created_at", { ascending: false });
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.json([]); // safe fallback
     }
   });
 
@@ -746,9 +746,9 @@ async function startServer() {
       else if (guest_id) query = query.eq("guest_id", guest_id as string);
       const { data, error } = await query;
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.json([]); // safe fallback
     }
   });
 
@@ -758,7 +758,7 @@ async function startServer() {
       await supabase.from("messages").update({ is_read: true }).eq("user_id", userId).eq("sender_role", "admin");
       res.json({ success: true });
     } catch (e: any) {
-      res.status(500).json({ error: e.message });
+      res.json([]); // safe fallback
     }
   });
 
@@ -804,7 +804,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("users").select("id, name, email, phone, balance, personal_number, is_vip, is_banned, created_at").order("created_at", { ascending: false });
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -870,7 +870,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("orders").select("*, users(name, email, personal_number), order_items(*, products(name))").order("created_at", { ascending: false });
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -904,7 +904,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("transactions").select("*, users(name, personal_number), payment_methods(name)").order("created_at", { ascending: false });
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -958,7 +958,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("vouchers").select("*").order("created_at", { ascending: false });
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -1078,7 +1078,7 @@ async function startServer() {
     try {
       const { data, error } = await supabase.from("auto_replies").select("*").order("created_at", { ascending: false });
       if (error) throw error;
-      res.json(data || []);
+      res.json(Array.isArray(data) ? data : []);
     } catch (e: any) {
       res.status(500).json({ error: e.message });
     }
@@ -1149,6 +1149,16 @@ async function startServer() {
           userBot!.sendMessage(u.telegram_chat_id, `🔔 إعلان جديد:\n\n${message}`);
         });
       }
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/report-error", async (req, res) => {
+    try {
+      const { message, stack, url, userId } = req.body;
+      console.error(`[Client Error] ${url || ""}: ${message}\n${stack || ""}`);
       res.json({ success: true });
     } catch (e: any) {
       res.status(500).json({ error: e.message });
