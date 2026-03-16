@@ -1,0 +1,2668 @@
+import express from "express";
+import { createServer as createViteServer } from "vite";
+import path from "path";
+import { fileURLToPath } from "url";
+import dotenv from "dotenv";
+import TelegramBot from "node-telegram-bot-api";
+import bcrypt from "bcryptjs";
+import { createClient } from "@supabase/supabase-js";
+import webpush from "web-push";
+
+dotenv.config();
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
+// --- Supabase Configuration ---
+const supabaseUrl = process.env.SUPABASE_URL || "";
+const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || "";
+
+if (!supabaseUrl || !supabaseKey) {
+  console.error("Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables.");
+}
+
+const supabase = createClient(supabaseUrl, supabaseKey);
+
+// --- Web Push Configuration ---
+let vapidKeys = {
+  publicKey: process.env.VAPID_PUBLIC_KEY!,
+  privateKey: process.env.VAPID_PRIVATE_KEY!,
+};
+
+if (vapidKeys.publicKey && vapidKeys.privateKey) {
+  try {
+    webpush.setVapidDetails(
+      "mailto:yallamha86@gmail.com",
+      vapidKeys.publicKey,
+      vapidKeys.privateKey
+    );
+  } catch (e) {
+    console.error("Failed to set VAPID details. Push notifications may not work.", e);
+  }
+}
+
+// --- Push Notifications ---
+const sendPushNotification = async (userId: string | null, title: string, body: string, url: string = "/") => {
+  try {
+    let query = supabase.from("push_subscriptions").select("subscription");
+    if (userId) query = query.eq("user_id", userId);
+
+    const { data: subscriptions } = await query;
+
+    if (subscriptions) {
+      subscriptions.forEach(sub => {
+        try {
+          const subscription = JSON.parse(sub.subscription);
+          webpush.sendNotification(subscription, JSON.stringify({ title, body, url }))
+            .catch(async err => {
+              if (err.statusCode === 410 || err.statusCode === 404) {
+                await supabase.from("push_subscriptions").delete().eq("subscription", sub.subscription);
+              }
+            });
+        } catch (e) {
+          console.error("Push error", e);
+        }
+      });
+    }
+  } catch (e) {
+    console.error("Push notification error", e);
+  }
+};
+
+// --- Telegram Helpers ---
+const sendTelegramMessage = async (text: string) => {
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  const chatId = process.env.TELEGRAM_CHAT_ID;
+  if (!token || !chatId) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+  } catch (e) {
+    console.error("Telegram error", e);
+  }
+};
+
+const sendTelegramToUser = async (userId: string, text: string) => {
+  const { data: user } = await supabase.from("users").select("telegram_chat_id").eq("id", userId).single();
+  if (!user?.telegram_chat_id) return;
+  const token = process.env.TELEGRAM_USER_BOT_TOKEN || process.env.TELEGRAM_BOT_TOKEN;
+  if (!token) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: user.telegram_chat_id, text }),
+    });
+  } catch (e) {
+    console.error("Telegram user notify error", e);
+  }
+};
+
+// --- User States for Bot Conversations ---
+const userStates = new Map<number, { step: string; data: any }>();
+
+let adminBot: TelegramBot | null = null;
+let userBot: TelegramBot | null = null;
+
+// --- Main Menu Helper ---
+async function sendMainMenu(chatId: number, user: any, bot: TelegramBot) {
+  const { data: setting } = await supabase.from("settings").select("value").eq("key", "support_whatsapp").single();
+  const whatsappLink = setting ? `https://wa.me/${setting.value.replace("+", "")}` : "https://t.me/your_support_username";
+
+  bot.sendMessage(chatId, `أهلاً بك ${user.name} في القائمة الرئيسية:`, {
+    reply_markup: {
+      keyboard: [
+        [{ text: "📄 سياسة الخصوصية" }, { text: "💬 الدعم الفني" }],
+        [{ text: "🚪 تسجيل الخروج" }]
+      ],
+      resize_keyboard: true
+    }
+  });
+
+  bot.sendMessage(chatId, "الخيارات المتاحة:", {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: "👤 معلوماتي", callback_data: "my_info" }, { text: "💰 رصيدي", callback_data: "my_balance" }],
+        [{ text: "💳 دفعاتي", callback_data: "my_payments" }, { text: "📦 طلباتي", callback_data: "my_orders" }],
+        [{ text: "🚀 شحن التطبيقات", callback_data: "charge_apps" }],
+        [{ text: "💳 شحن الرصيد", callback_data: "topup_balance" }],
+        [{ text: "🎁 المكافآت", callback_data: "rewards" }],
+        [{ text: "🔥 العروض", callback_data: "offers" }, { text: "🎁 استرداد كود", callback_data: "redeem_voucher" }],
+        [{ text: "📢 مشاركة البوت", callback_data: "share" }, { text: "🔗 الاحالة", callback_data: "referral" }]
+      ]
+    }
+  });
+}
+
+// --- Process Bot Order (Supabase) ---
+async function processBotOrder(chatId: number, user: any, product: any, price: number, extraData: any) {
+  try {
+    const { data: order, error: orderErr } = await supabase.from("orders").insert({
+      user_id: user.id,
+      total_amount: price,
+      meta: JSON.stringify(extraData)
+    }).select().single();
+
+    if (orderErr) throw orderErr;
+
+    await supabase.from("order_items").insert({
+      order_id: order.id,
+      product_id: product.id,
+      price_at_purchase: product.price,
+      quantity: 1,
+      extra_data: JSON.stringify(extraData)
+    });
+
+    await supabase.from("users").update({ balance: user.balance - price }).eq("id", user.id);
+
+    // Referral commission 5%
+    if (user.referred_by_id) {
+      const commission = price * 0.05;
+      await supabase.rpc("increment_balance", { user_id_param: user.referred_by_id, amount_param: commission });
+    }
+
+    userBot?.sendMessage(chatId, `✅ تمت عملية الشراء بنجاح!\nرقم الطلب: ${order.id}\nالمنتج: ${product.name}\nالمبلغ المخصوم: ${price.toFixed(2)}$`);
+
+    const adminChatId = process.env.TELEGRAM_CHAT_ID;
+    if (adminChatId) {
+      const adminMsg = `🔔 طلب جديد من البوت #ORD${order.id}\nالاسم: ${user.name}\nProduct: ${product.name}\nTotal: ${price}`;
+      adminBot?.sendMessage(adminChatId, adminMsg);
+    }
+  } catch (e) {
+    console.error(e);
+    userBot?.sendMessage(chatId, "❌ حدث خطأ أثناء معالجة الطلب.");
+  }
+}
+
+// ============================================================
+// START SERVER
+// ============================================================
+async function startServer() {
+  const app = express();
+  app.use(express.json());
+  const PORT = 3000;
+
+  app.use((req, res, next) => {
+    if (req.url.startsWith("/api")) {
+      console.log(`${new Date().toISOString()} - ${req.method} ${req.url}`);
+    }
+    next();
+  });
+
+  // =================== API ROUTES ===================
+
+  app.get("/api/health", (req, res) => {
+    res.json({ status: "ok", timestamp: new Date().toISOString() });
+  });
+
+  app.get("/api/settings", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("settings").select("*");
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/categories", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("categories").select("*").eq("active", true).order("order_index");
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/categories/:id/subcategories", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("subcategories").select("*").eq("category_id", req.params.id).eq("active", true).order("order_index");
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/subcategories", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("subcategories").select("*").eq("active", true).order("order_index");
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/subcategories/:id/products", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("products").select("*").eq("subcategory_id", req.params.id).eq("available", true);
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/subcategories/:id/sub-sub-categories", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("sub_sub_categories").select("*").eq("subcategory_id", req.params.id).eq("active", true).order("order_index");
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/sub-sub-categories", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("sub_sub_categories").select("*").eq("active", true).order("order_index");
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/sub-sub-categories/:id/products", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("products").select("*").eq("sub_sub_category_id", req.params.id).eq("available", true);
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/banners", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("banners").select("*").order("order_index");
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/offers", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("offers").select("*").eq("active", true).order("created_at", { ascending: false });
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/payment-methods", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("payment_methods").select("*").eq("active", true);
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // =================== AUTH ===================
+
+  app.post("/api/auth/register", async (req, res) => {
+    const { name, email, password, phone, referralCode } = req.body;
+    try {
+      let personalNumber = "";
+      while (true) {
+        personalNumber = Math.floor(1000000 + Math.random() * 9000000).toString();
+        const { data: existing } = await supabase.from("users").select("id").eq("personal_number", personalNumber).single();
+        if (!existing) break;
+      }
+
+      let referredById = null;
+      if (referralCode) {
+        const { data: referrer } = await supabase.from("users").select("id").eq("personal_number", referralCode).single();
+        if (referrer) {
+          referredById = referrer.id;
+          await supabase.rpc("increment_referral_count", { user_id_param: referrer.id });
+        }
+      }
+
+      const salt = await bcrypt.genSalt(10);
+      const hashedPassword = await bcrypt.hash(password, salt);
+
+      const { data: user, error } = await supabase.from("users").insert({
+        name, email, password_hash: hashedPassword, phone, personal_number: personalNumber, referred_by_id: referredById
+      }).select().single();
+
+      if (error) throw error;
+
+      await supabase.from("user_stats").insert({ user_id: user.id });
+      const { data: statsRaw } = await supabase.from("user_stats").select("*").eq("user_id", user.id).single();
+      const stats = statsRaw || { user_id: user.id, total_orders_count: 0, referral_count: 0, login_days_count: 0, total_recharge_sum: 0, active_discount: 0, claimed_reward_index: -1, one_product_discount_percent: 0, has_flaming_theme: false, has_special_support: false, has_priority_orders: false, profile_badge: null, custom_theme_color: null };
+
+      sendTelegramMessage(`👤 مستخدم جديد\nالاسم: ${name}\nالهاتف: ${phone}\nالرقم الشخصي: ${personalNumber}`);
+      const { password_hash: _ph, ...userWithoutPass } = user;
+      res.json({ ...userWithoutPass, stats });
+    } catch (e: any) {
+      res.status(400).json({ error: e.message || "Registration failed" });
+    }
+  });
+
+  app.post("/api/auth/login", async (req, res) => {
+    const { email, password } = req.body;
+    const { data: user } = await supabase.from("users").select("*").eq("email", email).single();
+
+    if (user) {
+      if (user.is_banned) return res.status(403).json({ error: "Your account has been banned." });
+      const isMatch = await bcrypt.compare(password, user.password_hash);
+      if (isMatch) {
+        const today = new Date().toISOString().split("T")[0];
+        const { data: stats } = await supabase.from("user_stats").select("last_login_date, login_days_count").eq("user_id", user.id).single();
+        if (stats && stats.last_login_date !== today) {
+          await supabase.from("user_stats").update({ last_login_date: today, login_days_count: (stats.login_days_count || 0) + 1 }).eq("user_id", user.id);
+        }
+
+        const { password_hash, ...userWithoutPass } = user;
+        let { data: fullStats } = await supabase.from("user_stats").select("*").eq("user_id", user.id).single();
+        if (!fullStats) {
+          await supabase.from("user_stats").insert({ user_id: user.id });
+          const { data: newStats } = await supabase.from("user_stats").select("*").eq("user_id", user.id).single();
+          fullStats = newStats;
+        }
+        const safeStats = fullStats || {
+          user_id: user.id, total_orders_count: 0, referral_count: 0,
+          login_days_count: 0, total_recharge_sum: 0, active_discount: 0,
+          claimed_reward_index: -1, one_product_discount_percent: 0,
+          has_flaming_theme: false, has_special_support: false,
+          has_priority_orders: false, profile_badge: null, custom_theme_color: null
+        };
+        sendTelegramMessage(`🔑 تسجيل دخول\nالاسم: ${user.name}\nالرقم الشخصي: ${user.personal_number}`);
+        res.json({ ...userWithoutPass, stats: safeStats });
+        return;
+      }
+    }
+    res.status(401).json({ error: "Invalid credentials" });
+  });
+
+  // =================== USER ROUTES ===================
+
+  app.get("/api/user/:id", async (req, res) => {
+    try {
+      const { data: user, error } = await supabase.from("users").select("*").eq("id", req.params.id).single();
+      if (error) throw error;
+      if (!user) return res.status(404).json({ error: "User not found" });
+      const { password_hash, ...userWithoutPass } = user;
+      let { data: stats } = await supabase.from("user_stats").select("*").eq("user_id", user.id).single();
+      if (!stats) {
+        await supabase.from("user_stats").insert({ user_id: user.id });
+        const { data: newStats } = await supabase.from("user_stats").select("*").eq("user_id", user.id).single();
+        stats = newStats;
+      }
+      const safeStats = stats || { user_id: user.id, total_orders_count: 0, referral_count: 0, login_days_count: 0, total_recharge_sum: 0, active_discount: 0, claimed_reward_index: -1, one_product_discount_percent: 0, has_flaming_theme: false, has_special_support: false, has_priority_orders: false, profile_badge: null, custom_theme_color: null };
+      res.json({ ...userWithoutPass, stats: safeStats });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/user/:userId/avatar", async (req, res) => {
+    try {
+      const { avatarUrl } = req.body;
+      await supabase.from("users").update({ avatar_url: avatarUrl }).eq("id", req.params.userId);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.patch("/api/user/:id/avatar", async (req, res) => {
+    try {
+      const { avatar_url } = req.body;
+      if (!avatar_url) return res.status(400).json({ error: "Missing avatar URL" });
+      await supabase.from("users").update({ avatar_url }).eq("id", req.params.id);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/user/update", async (req, res) => {
+    try {
+      const { userId, name, phone } = req.body;
+      await supabase.from("users").update({ name, phone }).eq("id", userId);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/user/unlink-telegram", async (req, res) => {
+    try {
+      const { userId } = req.body;
+      await supabase.from("users").update({ telegram_chat_id: null }).eq("id", userId);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/user/generate-linking-code", async (req, res) => {
+    try {
+      const { userId } = req.body;
+      const code = Math.floor(100000 + Math.random() * 900000).toString();
+      const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+      const { error } = await supabase.from("telegram_linking_codes").insert({ user_id: userId, code, expires_at: expiresAt });
+      if (error) throw error;
+      res.json({ code });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/user/update-theme", async (req, res) => {
+    try {
+      const { userId, color } = req.body;
+      await supabase.from("user_stats").update({ custom_theme_color: color }).eq("user_id", userId);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // =================== REFERRALS ===================
+
+  app.get("/api/referrals/stats/:userId", async (req, res) => {
+    try {
+      const { data: referrals, error } = await supabase.from("users").select("id, name, created_at").eq("referred_by_id", req.params.userId);
+      if (error) throw error;
+      res.json({ count: referrals?.length || 0, referrals: referrals || [] });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // =================== NOTIFICATIONS ===================
+
+  app.get("/api/notifications/:userId", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("notifications").select("*")
+        .or(`user_id.eq.${req.params.userId},user_id.is.null`)
+        .order("created_at", { ascending: false });
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.json([]); // always array
+    }
+  });
+
+  app.post("/api/notifications/mark-read", async (req, res) => {
+    try {
+      const { notificationId } = req.body;
+      await supabase.from("notifications").update({ is_read: true }).eq("id", notificationId);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // =================== PUSH SUBSCRIPTIONS ===================
+
+  app.get("/api/push/key", (req, res) => {
+    res.json({ publicKey: vapidKeys.publicKey });
+  });
+
+  app.post("/api/push/subscribe", async (req, res) => {
+    try {
+      const { userId, subscription } = req.body;
+      const subStr = JSON.stringify(subscription);
+      const { data: existing } = await supabase.from("push_subscriptions").select("id").eq("user_id", userId).eq("subscription", subStr).single();
+      if (!existing) {
+        await supabase.from("push_subscriptions").insert({ user_id: userId, subscription: subStr });
+      }
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // =================== ORDERS ===================
+
+  app.post("/api/orders", async (req, res) => {
+    try {
+      const { userId, productId, quantity, extraData } = req.body;
+      const { data: user, error: uErr } = await supabase.from("users").select("*").eq("id", userId).single();
+      if (uErr) throw uErr;
+      const { data: product, error: pErr } = await supabase.from("products").select("*").eq("id", productId).single();
+      if (pErr) throw pErr;
+
+      if (!user || !product) return res.status(404).json({ error: "Not found" });
+
+      let total = product.price * quantity;
+      const { data: stats } = await supabase.from("user_stats").select("*").eq("user_id", userId).single();
+      let discountPercent = user.is_vip ? 5 : 0;
+
+      if (stats) {
+        if (stats.discount_expires_at && new Date(stats.discount_expires_at) > new Date()) {
+          discountPercent = Math.max(discountPercent, stats.active_discount || 0);
+        }
+        if (stats.one_product_discount_percent > 0) {
+          discountPercent = Math.max(discountPercent, stats.one_product_discount_percent);
+          await supabase.from("user_stats").update({ one_product_discount_percent: 0 }).eq("user_id", userId);
+        }
+      }
+
+      if (discountPercent > 0) total *= (1 - discountPercent / 100);
+      if (user.balance < total) return res.status(400).json({ error: "Insufficient balance" });
+
+      const { data: order, error: orderErr } = await supabase.from("orders").insert({
+        user_id: userId, total_amount: total, meta: JSON.stringify(extraData)
+      }).select().single();
+      if (orderErr) throw orderErr;
+
+      await supabase.from("order_items").insert({
+        order_id: order.id, product_id: productId, price_at_purchase: product.price, quantity, extra_data: JSON.stringify(extraData)
+      });
+
+      await supabase.from("users").update({ balance: user.balance - total }).eq("id", userId);
+
+      if (user.referred_by_id) {
+        const commission = total * 0.05;
+        await supabase.rpc("increment_balance", { user_id_param: user.referred_by_id, amount_param: commission });
+      }
+
+      sendTelegramMessage(`🔔 طلب جديد #ORD${order.id}\nالاسم: ${user.name}\nProduct: ${product.name}\nTotal: ${total}`);
+
+      const adminChatId = process.env.TELEGRAM_CHAT_ID;
+      if (adminChatId && adminBot) {
+        adminBot.sendMessage(adminChatId, `🔔 طلب جديد #ORD${order.id}\nالاسم: ${user.name}\nالرقم الشخصي: ${user.personal_number}\nProduct: ${product.name}\nTotal: ${total}\nData: ${JSON.stringify(extraData)}`);
+      }
+
+      res.json({ success: true, orderId: order.id });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/orders/user/:userId", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("orders").select("*, order_items(*)").eq("user_id", req.params.userId).order("created_at", { ascending: false });
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.json([]); // safe fallback
+    }
+  });
+
+  // =================== TRANSACTIONS ===================
+
+  app.post("/api/transactions/upload", async (req, res) => {
+    try {
+      const { userId, paymentMethodId, amount, note, receiptImageUrl } = req.body;
+      const { data: user } = await supabase.from("users").select("id, name, personal_number").eq("id", userId).single();
+      const { data: method } = await supabase.from("payment_methods").select("name").eq("id", paymentMethodId).single();
+
+      const { data: pending } = await supabase.from("transactions").select("id", { count: "exact" }).eq("user_id", userId).eq("status", "pending");
+      if ((pending?.length || 0) >= 2) {
+        return res.status(400).json({ error: "لا يمكنك إرسال أكثر من مدفوعتين قيد المراجعة." });
+      }
+
+      const { data: tx, error: txErr } = await supabase.from("transactions").insert({
+        user_id: userId,
+        payment_method_id: paymentMethodId,
+        amount,
+        note,
+        receipt_image_url: receiptImageUrl,
+        status: "pending"
+      }).select().single();
+      if (txErr) throw txErr;
+
+      sendTelegramMessage(`💳 شحن رصيد جديد\nالاسم: ${user?.name}\nالرقم الشخصي: ${user?.personal_number}\nAmount: ${amount}\nMethod: ${method?.name}`);
+
+      const adminChatId = process.env.TELEGRAM_CHAT_ID;
+      if (adminChatId && adminBot) {
+        const adminMsg = `💰 طلب شحن جديد! #TX${tx.id}\n\nالمستخدم: ${user?.name}\nالمبلغ: ${amount}$\nالطريقة: ${method?.name}\n\nرابط الإيصال: ${receiptImageUrl}`;
+        adminBot.sendMessage(adminChatId, adminMsg, {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "✅ قبول", callback_data: `approve_tx_${tx.id}` }, { text: "❌ رفض", callback_data: `reject_tx_${tx.id}` }]
+            ]
+          }
+        });
+      }
+
+      res.json({ success: true, transactionId: tx.id });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/transactions/user/:userId", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("transactions").select("*").eq("user_id", req.params.userId).order("created_at", { ascending: false });
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.json([]); // safe fallback
+    }
+  });
+
+  // =================== REWARDS ===================
+
+  app.post("/api/rewards/claim", async (req, res) => {
+    try {
+      const { userId, rewardIndex, goalIndex } = req.body;
+      const idx = rewardIndex ?? goalIndex; // قبول كلا الاسمين
+      if (idx === undefined || idx === null) return res.status(400).json({ error: "Missing reward index" });
+
+      const { data: stats, error: sErr } = await supabase.from("user_stats").select("*").eq("user_id", userId).single();
+      if (sErr || !stats) return res.status(404).json({ error: "User stats not found" });
+
+      const goals = [5, 15, 30, 50, 100, 200, 500];
+
+      if ((stats.claimed_reward_index ?? -1) >= idx) return res.status(400).json({ error: "Reward already claimed" });
+      if (idx > 0 && (stats.claimed_reward_index ?? -1) < idx - 1) return res.status(400).json({ error: "Claim previous rewards first" });
+      if ((stats.total_recharge_sum || 0) < goals[idx]) return res.status(400).json({ error: "Goal not reached yet" });
+
+      await applyReward(userId, idx);
+
+      await supabase.from("notifications").insert({
+        user_id: userId,
+        title: "🎁 تم استلام مكافأة",
+        message: `مبروك! لقد حصلت على مكافأة هدف ${goals[idx]}$!`,
+        type: "success"
+      });
+
+      // إرجاع stats المحدّثة للواجهة
+      const { data: updatedStats } = await supabase.from("user_stats").select("*").eq("user_id", userId).single();
+      const { data: updatedUser } = await supabase.from("users").select("balance").eq("id", userId).single();
+
+      res.json({ success: true, stats: updatedStats, balance: updatedUser?.balance });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // =================== VOUCHERS ===================
+
+  app.post("/api/vouchers/redeem", async (req, res) => {
+    try {
+      const { userId, code } = req.body;
+      const { data: voucher } = await supabase.from("vouchers").select("*").eq("code", code).eq("active", true).single();
+      if (!voucher) return res.status(404).json({ error: "Invalid or inactive voucher" });
+
+      const { data: usage } = await supabase.from("voucher_uses").select("id").eq("voucher_id", voucher.id).eq("user_id", userId).single();
+      if (usage) return res.status(400).json({ error: "Voucher already used" });
+
+      if (voucher.used_count >= voucher.max_uses) return res.status(400).json({ error: "Voucher fully used" });
+
+      await supabase.from("voucher_uses").insert({ voucher_id: voucher.id, user_id: userId });
+      await supabase.from("vouchers").update({ used_count: voucher.used_count + 1 }).eq("id", voucher.id);
+      await supabase.rpc("increment_balance", { user_id_param: userId, amount_param: voucher.amount });
+      await supabase.from("user_stats").update({ vouchers_redeemed_count: supabase.rpc as any }).eq("user_id", userId);
+
+      res.json({ success: true, amount: voucher.amount });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // =================== CHAT ===================
+
+  app.post("/api/chat/send", async (req, res) => {
+    try {
+      const { user_id, guest_id, sender_role, content, image_url, type, rating } = req.body;
+
+      if (sender_role === "user" && user_id) {
+        const { data: user } = await supabase.from("users").select("is_vip").eq("id", user_id).single();
+        const { data: statsData } = await supabase.from("user_stats").select("claimed_reward_index").eq("user_id", user_id).single();
+
+        if (!user?.is_vip) {
+          let limit = 5;
+          if (statsData) {
+            if (statsData.claimed_reward_index >= 6) limit = 100;
+            else if (statsData.claimed_reward_index >= 3) limit = 30;
+          }
+
+          const today = new Date().toISOString().split("T")[0];
+          const { data: countData } = await supabase.from("daily_message_counts").select("count").eq("user_id", user_id).eq("date", today).single();
+          const currentCount = countData?.count || 0;
+
+          if (currentCount >= limit) return res.status(403).json({ error: `لقد وصلت للحد اليومي (${limit} رسالة).` });
+
+          if (countData) {
+            await supabase.from("daily_message_counts").update({ count: currentCount + 1 }).eq("user_id", user_id).eq("date", today);
+          } else {
+            await supabase.from("daily_message_counts").insert({ user_id, date: today, count: 1 });
+          }
+        }
+      }
+
+      const { data: msg, error } = await supabase.from("messages").insert({
+        user_id, guest_id, sender_role, content, image_url, type: type || "text", rating
+      }).select().single();
+      if (error) throw error;
+
+      if (sender_role === "user") {
+        sendTelegramMessage(`💬 رسالة جديدة:\n${content || "[صورة]"}`);
+
+        if (content) {
+          const { data: autoReply } = await supabase.from("auto_replies").select("reply_text").ilike("trigger_text", content.trim()).limit(1).single();
+          if (autoReply) {
+            await supabase.from("messages").insert({
+              user_id, guest_id, sender_role: "admin", content: autoReply.reply_text, type: "bot_reply"
+            });
+          }
+        }
+      } else if (user_id) {
+        sendPushNotification(user_id, "رد من الدعم", "لقد تلقيت رداً جديداً.");
+        sendTelegramToUser(user_id, `💬 رد جديد من الدعم الفني:\n${content || "[صورة]"}`);
+      }
+
+      res.json({ success: true, id: msg.id });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/chat/messages", async (req, res) => {
+    try {
+      const { user_id, guest_id } = req.query;
+      let query = supabase.from("messages").select("*").order("created_at");
+      if (user_id) query = query.eq("user_id", user_id as string);
+      else if (guest_id) query = query.eq("guest_id", guest_id as string);
+      const { data, error } = await query;
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.json([]);
+    }
+  });
+
+  // Legacy endpoint: /api/chat/messages/:id
+  app.get("/api/chat/messages/:id", async (req, res) => {
+    try {
+      const { id } = req.params;
+      const { guest } = req.query;
+      let query = supabase.from("messages").select("*").order("created_at");
+      if (guest === "true") {
+        query = query.eq("guest_id", id).is("user_id", null);
+      } else {
+        query = query.eq("user_id", id);
+      }
+      const { data, error } = await query;
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.json([]);
+    }
+  });
+
+  app.post("/api/chat/mark-read", async (req, res) => {
+    try {
+      const { userId } = req.body;
+      await supabase.from("messages").update({ is_read: true }).eq("user_id", userId).eq("sender_role", "admin");
+      res.json({ success: true });
+    } catch (e: any) {
+      res.json([]); // safe fallback
+    }
+  });
+
+  // =================== ADMIN ROUTES ===================
+
+  app.post("/api/admin/login", async (req, res) => {
+    try {
+      const { password } = req.body;
+      const { data: setting } = await supabase.from("settings").select("value").eq("key", "admin_password").single();
+      if (password === (setting?.value || "12321")) {
+        res.json({ success: true });
+      } else {
+        res.status(401).json({ error: "Incorrect password" });
+      }
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/change-password", async (req, res) => {
+    try {
+      const { newPassword } = req.body;
+      await supabase.from("settings").upsert({ key: "admin_password", value: newPassword });
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/settings", async (req, res) => {
+    try {
+      const { settings } = req.body;
+      for (const s of settings) {
+        await supabase.from("settings").upsert({ key: s.key, value: s.value });
+      }
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/admin/users", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("users").select("id, name, email, phone, balance, personal_number, is_vip, is_banned, created_at").order("created_at", { ascending: false });
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/users/:id/vip", async (req, res) => {
+    try {
+      const { isVip } = req.body;
+      await supabase.from("users").update({ is_vip: isVip }).eq("id", req.params.id);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/users/:id/balance", async (req, res) => {
+    try {
+      const { amount } = req.body;
+      await supabase.from("users").update({ balance: amount }).eq("id", req.params.id);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/users/:id/block", async (req, res) => {
+    try {
+      const { blockedUntil } = req.body;
+      await supabase.from("users").update({ blocked_until: blockedUntil, is_banned: !!blockedUntil }).eq("id", req.params.id);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete("/api/admin/users/:id", async (req, res) => {
+    try {
+      await deleteUserCompletely(req.params.id);
+      res.json({ success: true });
+    } catch (e: any) {
+      console.error("Delete user error:", e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/manual-topup", async (req, res) => {
+    try {
+      const { personalNumber, amount, note } = req.body;
+      const { data: user } = await supabase.from("users").select("id, name").eq("personal_number", personalNumber).single();
+      if (!user) return res.status(404).json({ error: "User not found" });
+
+      await supabase.rpc("increment_balance", { user_id_param: user.id, amount_param: amount });
+      await supabase.from("transactions").insert({ user_id: user.id, amount, note: note || "شحن يدوي من الإدارة", status: "approved" });
+      await supabase.from("user_stats").update({ total_recharge_sum: supabase.rpc as any }).eq("user_id", user.id);
+
+      sendTelegramMessage(`💰 شحن يدوي\nالاسم: ${user.name}\nالرقم الشخصي: ${personalNumber}\nالمبلغ: ${amount}`);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/admin/orders", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("orders").select("*, users(name, email, personal_number), order_items(*, products(name))").order("created_at", { ascending: false });
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/orders/:id/status", async (req, res) => {
+    try {
+      const { status, response, admin_response } = req.body;
+      const responseText = response || admin_response;
+      const { data: order, error: oErr } = await supabase.from("orders").update({ status, admin_response: responseText }).eq("id", req.params.id).select().single();
+      if (oErr) throw oErr;
+
+      await supabase.from("notifications").insert({
+        user_id: order.user_id,
+        title: `تحديث حالة الطلب #${req.params.id}`,
+        message: `حالة طلبك الآن: ${status}. ${responseText || ""}`,
+        type: status === "completed" ? "success" : "info"
+      });
+
+      if (order.user_id && responseText) {
+        sendTelegramToUser(order.user_id, `🔔 وصلك رد جديد على طلبك #${req.params.id}:\n\n${responseText}`);
+      }
+
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/admin/transactions", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("transactions").select("*, users(name, personal_number), payment_methods(name)").order("created_at", { ascending: false });
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/transactions/:id/approve", async (req, res) => {
+    try {
+      const { data: tx, error: txErr } = await supabase.from("transactions").select("*").eq("id", req.params.id).single();
+      if (txErr || !tx) return res.status(404).json({ error: "Transaction not found" });
+      if (tx.status !== "pending") return res.status(400).json({ error: "Invalid transaction" });
+
+      await supabase.from("transactions").update({ status: "approved" }).eq("id", req.params.id);
+      await supabase.rpc("increment_balance", { user_id_param: tx.user_id, amount_param: tx.amount });
+      await supabase.from("user_stats").update({ total_recharge_sum: tx.amount }).eq("user_id", tx.user_id);
+
+      await supabase.from("notifications").insert({
+        user_id: tx.user_id,
+        title: "تم قبول الشحن",
+        message: `تمت إضافة ${tx.amount}$ إلى رصيدك بنجاح.`,
+        type: "success"
+      });
+
+      sendTelegramToUser(tx.user_id, `✅ تم قبول طلب الشحن الخاص بك! تم إضافة ${tx.amount}$ لرصيدك.`);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/transactions/:id/reject", async (req, res) => {
+    try {
+      await supabase.from("transactions").update({ status: "rejected" }).eq("id", req.params.id);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/offers", async (req, res) => {
+    try {
+      const { title, description, image_url, active } = req.body;
+      const { data, error } = await supabase.from("offers").insert({ title, description, image_url, active }).select().single();
+      if (error) throw error;
+      res.json(data);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/admin/vouchers", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("vouchers").select("*").order("created_at", { ascending: false });
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/vouchers", async (req, res) => {
+    try {
+      const { code, amount, max_uses } = req.body;
+      const { data, error } = await supabase.from("vouchers").insert({ code, amount, max_uses }).select().single();
+      if (error) throw error;
+      res.json(data);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/banners", async (req, res) => {
+    try {
+      const { image_url, order_index } = req.body;
+      const { data, error } = await supabase.from("banners").insert({ image_url, order_index }).select().single();
+      if (error) throw error;
+      res.json(data);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/categories", async (req, res) => {
+    try {
+      const { name, image_url, order_index, active, special_id } = req.body;
+      if (!name) return res.status(400).json({ error: "اسم القسم مطلوب" });
+      const { data, error } = await supabase.from("categories").insert({
+        name, image_url,
+        order_index: order_index ?? 0,
+        active: active ?? true,
+        special_id: special_id || null
+      }).select().single();
+      if (error) throw error;
+      res.json(data);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/subcategories", async (req, res) => {
+    try {
+      let { category_id, category_special_id, name, image_url, order_index, active, special_id } = req.body;
+
+      // إذا أرسلت الواجهة category_special_id نبحث عن الـ id الحقيقي
+      if (!category_id && category_special_id) {
+        // البحث بـ special_id أولاً، ثم بالـ id المباشر
+        const { data: catBySpecial } = await supabase.from("categories").select("id").eq("special_id", category_special_id).maybeSingle();
+        if (catBySpecial) {
+          category_id = catBySpecial.id;
+        } else {
+          const { data: catById } = await supabase.from("categories").select("id").eq("id", category_special_id).maybeSingle();
+          if (catById) {
+            category_id = catById.id;
+          } else {
+            return res.status(404).json({ error: `لم يتم العثور على قسم رئيسي بالرقم: ${category_special_id}` });
+          }
+        }
+      }
+
+      if (!category_id) return res.status(400).json({ error: "يرجى تحديد القسم الرئيسي" });
+
+      const { data, error } = await supabase.from("subcategories").insert({
+        category_id, name, image_url,
+        order_index: order_index ?? 0,
+        active: active ?? true,
+        special_id: special_id || null
+      }).select().single();
+      if (error) throw error;
+      res.json(data);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/sub-sub-categories", async (req, res) => {
+    try {
+      let { subcategory_id, subcategory_special_id, name, image_url, order_index, active, special_id } = req.body;
+
+      // إذا أرسل الـ id مباشرة نستخدمه
+      // إذا أرسل special_id نبحث به
+      if (!subcategory_id && subcategory_special_id) {
+        // محاولة البحث بـ special_id أولاً
+        const { data: subBySpecial } = await supabase.from("subcategories").select("id").eq("special_id", subcategory_special_id).maybeSingle();
+        if (subBySpecial) {
+          subcategory_id = subBySpecial.id;
+        } else {
+          // إذا ما لقيناه بـ special_id نحاول نتعامل معه كـ id مباشر
+          const { data: subById } = await supabase.from("subcategories").select("id").eq("id", subcategory_special_id).maybeSingle();
+          if (subById) {
+            subcategory_id = subById.id;
+          } else {
+            return res.status(404).json({ error: `لم يتم العثور على قسم فرعي بالرقم: ${subcategory_special_id}` });
+          }
+        }
+      }
+
+      if (!subcategory_id) return res.status(400).json({ error: "يرجى تحديد القسم الفرعي" });
+      if (!name) return res.status(400).json({ error: "اسم القسم الفرعي الفرعي مطلوب" });
+
+      const { data, error } = await supabase.from("sub_sub_categories").insert({
+        subcategory_id, name, image_url: image_url || "",
+        order_index: order_index ?? 0,
+        active: active ?? true,
+        special_id: special_id || null
+      }).select().single();
+      if (error) throw error;
+      res.json(data);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/payment-methods", async (req, res) => {
+    try {
+      const { name, image_url, wallet_address, instructions, min_amount, active } = req.body;
+      const { data, error } = await supabase.from("payment_methods").insert({ name, image_url, wallet_address, instructions, min_amount, active }).select().single();
+      if (error) throw error;
+      res.json(data);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/products", async (req, res) => {
+    try {
+      let {
+        subcategory_id, sub_sub_category_id,
+        category_special_id, subcategory_special_id, sub_sub_category_special_id,
+        name, price, description, image_url, store_type, requires_input,
+        min_quantity, available, external_id
+      } = req.body;
+
+      // البحث بـ special_id إذا لم يُرسل id مباشرة
+      if (!subcategory_id && subcategory_special_id) {
+        let query = supabase.from("subcategories").select("id").eq("special_id", subcategory_special_id);
+        if (category_special_id) {
+          const { data: cat } = await supabase.from("categories").select("id").eq("special_id", category_special_id).single();
+          if (cat) query = query.eq("category_id", cat.id);
+        }
+        const { data: sub } = await query.single();
+        if (!sub) return res.status(404).json({ error: `لم يتم العثور على قسم فرعي بالرقم الخاص: ${subcategory_special_id}` });
+        subcategory_id = sub.id;
+      }
+
+      if (!subcategory_id) return res.status(400).json({ error: "يرجى تحديد القسم الفرعي" });
+
+      if (!sub_sub_category_id && sub_sub_category_special_id) {
+        const { data: ss } = await supabase.from("sub_sub_categories").select("id").eq("special_id", sub_sub_category_special_id).eq("subcategory_id", subcategory_id).single();
+        if (ss) sub_sub_category_id = ss.id;
+      }
+
+      const { data, error } = await supabase.from("products").insert({
+        subcategory_id, sub_sub_category_id,
+        name, price: parseFloat(price) || 0,
+        description, image_url,
+        store_type: store_type || "normal",
+        requires_input: requires_input || false,
+        min_quantity: min_quantity ? parseInt(min_quantity) : null,
+        available: available ?? true,
+        external_id: external_id || null
+      }).select().single();
+      if (error) throw error;
+      res.json(data);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/products/:id/price", async (req, res) => {
+    try {
+      const { price, price_per_unit } = req.body;
+      const updateData: any = {};
+      if (price !== undefined) updateData.price = price;
+      if (price_per_unit !== undefined) updateData.price_per_unit = price_per_unit;
+      await supabase.from("products").update(updateData).eq("id", req.params.id);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete("/api/admin/:type/:id", async (req, res) => {
+    try {
+      const { type, id } = req.params;
+      const tableMap: any = {
+        categories: "categories", subcategories: "subcategories", products: "products",
+        banners: "banners", offers: "offers", vouchers: "vouchers",
+        "payment-methods": "payment_methods", "sub-sub-categories": "sub_sub_categories"
+      };
+      const table = tableMap[type];
+      if (!table) return res.status(400).json({ error: "Invalid type" });
+
+      // طرق الشحن - نعطّلها بدل الحذف إذا كان هناك معاملات مرتبطة
+      if (type === "payment-methods") {
+        const { data: txCount } = await supabase
+          .from("transactions")
+          .select("id")
+          .eq("payment_method_id", id)
+          .limit(1);
+        if (txCount && txCount.length > 0) {
+          // يوجد معاملات مرتبطة - نعطّل بدل الحذف
+          const { error } = await supabase.from("payment_methods").update({ active: false }).eq("id", id);
+          if (error) throw error;
+          return res.json({ success: true, message: "تم تعطيل طريقة الشحن (يوجد معاملات مرتبطة بها)" });
+        }
+      }
+
+      const { error } = await supabase.from(table).delete().eq("id", id);
+      if (error) throw error;
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/admin/auto-replies", async (req, res) => {
+    try {
+      const { data, error } = await supabase.from("auto_replies").select("*").order("created_at", { ascending: false });
+      if (error) throw error;
+      res.json(Array.isArray(data) ? data : []);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/auto-replies", async (req, res) => {
+    try {
+      const { trigger_text, reply_text } = req.body;
+      const { data, error } = await supabase.from("auto_replies").insert({ trigger_text, reply_text }).select().single();
+      if (error) throw error;
+      res.json(data);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.delete("/api/admin/auto-replies/:id", async (req, res) => {
+    try {
+      await supabase.from("auto_replies").delete().eq("id", req.params.id);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.get("/api/admin/chat/list", async (req, res) => {
+    try {
+      const { data: msgs } = await supabase
+        .from("messages")
+        .select("user_id, guest_id, content, created_at, sender_role, is_read")
+        .order("created_at", { ascending: false });
+
+      if (!msgs || msgs.length === 0) return res.json([]);
+
+      // تجميع المحادثات حسب المستخدم أو الضيف
+      const conversationsMap = new Map<string, any>();
+      for (const msg of msgs) {
+        const key = msg.user_id ? `user_${msg.user_id}` : `guest_${msg.guest_id}`;
+        if (!conversationsMap.has(key)) {
+          conversationsMap.set(key, {
+            id: msg.user_id || msg.guest_id,
+            user_id: msg.user_id,
+            guest_id: msg.guest_id,
+            is_guest: !msg.user_id,
+            last_message: msg.content,
+            last_message_at: msg.created_at,
+            unread_count: 0,
+          });
+        }
+        const conv = conversationsMap.get(key);
+        if (msg.sender_role === "user" && !msg.is_read) conv.unread_count++;
+      }
+
+      // جلب بيانات المستخدمين
+      const userIds = [...conversationsMap.values()].filter(c => c.user_id).map(c => c.user_id);
+      const usersMap = new Map<string, any>();
+      if (userIds.length > 0) {
+        const { data: users } = await supabase
+          .from("users")
+          .select("id, name, personal_number, avatar_url, is_vip, chat_blocked")
+          .in("id", userIds);
+        if (users) users.forEach((u: any) => usersMap.set(String(u.id), u));
+      }
+
+      const result = [...conversationsMap.values()].map(conv => {
+        if (conv.user_id) {
+          const u = usersMap.get(String(conv.user_id));
+          return { ...conv, name: u?.name || "مستخدم", personal_number: u?.personal_number || "", avatar_url: u?.avatar_url || null, is_vip: u?.is_vip || false, chat_blocked: u?.chat_blocked || false };
+        }
+        return { ...conv, name: "ضيف", personal_number: conv.guest_id, avatar_url: null, is_vip: false, chat_blocked: false };
+      });
+
+      result.sort((a: any, b: any) => new Date(b.last_message_at).getTime() - new Date(a.last_message_at).getTime());
+      res.json(result);
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/chat/mark-read", async (req, res) => {
+    try {
+      const { userId, guestId } = req.body;
+      if (userId) {
+        await supabase.from("messages").update({ is_read: true }).eq("user_id", userId).eq("sender_role", "user");
+      } else if (guestId) {
+        await supabase.from("messages").update({ is_read: true }).eq("guest_id", guestId).is("user_id", null).eq("sender_role", "user");
+      }
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/chat/block", async (req, res) => {
+    try {
+      const { userId, blocked } = req.body;
+      await supabase.from("users").update({ chat_blocked: blocked }).eq("id", userId);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/admin/broadcast", async (req, res) => {
+    try {
+      const { message } = req.body;
+      await supabase.from("notifications").insert({ title: "إعلان جديد", message, type: "info" });
+      sendPushNotification(null, "إعلان جديد", message);
+
+      const { data: users } = await supabase.from("users").select("telegram_chat_id").not("telegram_chat_id", "is", null);
+      if (users && userBot) {
+        users.forEach(u => {
+          userBot!.sendMessage(u.telegram_chat_id, `🔔 إعلان جديد:\n\n${message}`);
+        });
+      }
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  app.post("/api/report-error", async (req, res) => {
+    try {
+      const { message, stack, url, userId } = req.body;
+      console.error(`[Client Error] ${url || ""}: ${message}\n${stack || ""}`);
+      res.json({ success: true });
+    } catch (e: any) {
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  // 404 for API routes
+  app.all("/api/*", (req, res) => {
+    res.status(404).json({ error: `Route ${req.method} ${req.url} not found` });
+  });
+
+  // Vite middleware
+  if (process.env.NODE_ENV !== "production") {
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: "spa",
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static(path.join(__dirname, "dist")));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(__dirname, "dist", "index.html"));
+    });
+  }
+
+  app.listen(PORT, "0.0.0.0", () => {
+    console.log(`Server running on http://localhost:${PORT}`);
+  });
+
+  // =================== TELEGRAM BOTS ===================
+  startBots();
+
+  // Graceful shutdown
+  const shutdown = () => {
+    console.log("Shutting down gracefully...");
+    if (userBot) userBot.stopPolling();
+    if (adminBot) adminBot.stopPolling();
+    process.exit(0);
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+  process.on("unhandledRejection", (reason, promise) => console.error("Unhandled Rejection:", promise, reason));
+}
+
+
+// ============================================================
+// HELPER: حذف مستخدم مع كل بياناته المرتبطة
+// ============================================================
+async function deleteUserCompletely(userId: string) {
+  // الترتيب مهم - نحذف الجداول الفرعية أولاً قبل الجداول الرئيسية
+  await supabase.from("order_items").delete().in(
+    "order_id",
+    (await supabase.from("orders").select("id").eq("user_id", userId)).data?.map((o: any) => o.id) || []
+  );
+  await supabase.from("orders").delete().eq("user_id", userId);
+  await supabase.from("transactions").delete().eq("user_id", userId);
+  await supabase.from("notifications").delete().eq("user_id", userId);
+  await supabase.from("messages").delete().eq("user_id", userId);
+  await supabase.from("voucher_uses").delete().eq("user_id", userId);
+  await supabase.from("push_subscriptions").delete().eq("user_id", userId);
+  await supabase.from("daily_message_counts").delete().eq("user_id", userId);
+  await supabase.from("telegram_linking_codes").delete().eq("user_id", userId);
+  await supabase.from("user_stats").delete().eq("user_id", userId);
+  // أخيراً نحذف المستخدم نفسه
+  const { error } = await supabase.from("users").delete().eq("id", userId);
+  if (error) throw error;
+}
+
+// ============================================================
+// HELPER: Apply Reward Logic
+// ============================================================
+async function applyReward(userId: string, goalIndex: number) {
+  const now = new Date();
+  const oneMonth = new Date(now.getTime() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  const oneYear = new Date(now.getTime() + 365 * 24 * 60 * 60 * 1000).toISOString();
+
+  // دالة مساعدة لإضافة الرصيد بدون RPC
+  const addBalance = async (amount: number) => {
+    const { data: u } = await supabase.from("users").select("balance").eq("id", userId).single();
+    if (u) await supabase.from("users").update({ balance: (u.balance || 0) + amount }).eq("id", userId);
+  };
+
+  // تحديث claimed_reward_index أولاً
+  await supabase.from("user_stats").update({ claimed_reward_index: goalIndex }).eq("user_id", userId);
+
+  if (goalIndex === 0) {
+    await supabase.from("user_stats").update({ active_discount: 1, discount_expires_at: oneMonth }).eq("user_id", userId);
+  } else if (goalIndex === 1) {
+    await addBalance(1);
+    await supabase.from("user_stats").update({ active_discount: 2, discount_expires_at: oneMonth }).eq("user_id", userId);
+  } else if (goalIndex === 2) {
+    await addBalance(3);
+    await supabase.from("user_stats").update({ active_discount: 4, discount_expires_at: oneMonth, one_product_discount_percent: 10 }).eq("user_id", userId);
+  } else if (goalIndex === 3) {
+    await addBalance(5);
+    await supabase.from("user_stats").update({ active_discount: 5, discount_expires_at: oneYear }).eq("user_id", userId);
+  } else if (goalIndex === 4) {
+    await addBalance(5);
+    await supabase.from("user_stats").update({ active_discount: 7, discount_expires_at: oneMonth, one_product_discount_percent: 15, profile_badge: "silver", custom_theme_color: "yellow" }).eq("user_id", userId);
+  } else if (goalIndex === 5) {
+    await addBalance(10);
+    await supabase.from("user_stats").update({ active_discount: 10, discount_expires_at: oneMonth, one_product_discount_percent: 15, profile_badge: "gold", custom_theme_color: "red" }).eq("user_id", userId);
+  } else if (goalIndex === 6) {
+    await addBalance(20);
+    await supabase.from("user_stats").update({ active_discount: 10, discount_expires_at: oneMonth, one_product_discount_percent: 20, profile_badge: "gold_legendary", custom_theme_color: "any", has_special_support: true, has_priority_orders: true }).eq("user_id", userId);
+  }
+}
+
+// ============================================================
+// BOTS STARTUP
+// ============================================================
+async function startBots() {
+  await new Promise(resolve => setTimeout(resolve, 3000));
+
+  // ====== ADMIN BOT ======
+  const adminBotToken = process.env.TELEGRAM_BOT_TOKEN;
+  if (adminBotToken) {
+    try {
+      adminBot = new TelegramBot(adminBotToken, { polling: true });
+      const adminChatId = process.env.TELEGRAM_CHAT_ID;
+
+      adminBot.on("polling_error", (err: any) => {
+        if (err.message.includes("409 Conflict")) {
+          console.warn("Admin Bot polling conflict. Ignoring.");
+        } else {
+          console.error("Admin Bot polling error:", err);
+        }
+      });
+
+      adminBot.onText(/\/start/, (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        const welcomeMsg =
+          `أهلاً بك في بوت الإدارة 🛠️\n\n` +
+          `📢 الإشعارات:\n/nall - إشعار للجميع\n/nhe - إشعار لمستخدم محدد\n\n` +
+          `👤 المستخدمين:\n/topup - شحن رصيد يدوي\n/block - حظر مؤقت\n/deli - حذف مستخدم\n/vip - ترقية لـ VIP\n\n` +
+          `🛠️ المتجر:\n/cat - إضافة قسم\n/sub - إضافة قسم فرعي\n/subsub - إضافة قسم فرعي فرعي\n/prod - إضافة منتج\n/editprice - تعديل سعر\n/banner - إضافة بانر\n/offer - إضافة عرض\n/voucher - إضافة قسيمة\n\n` +
+          `🗑️ الحذف:\n/delcat /delsub /delsubsub /delprod /delbanner /deloffer /delvoucher /delpm`;
+        adminBot!.sendMessage(msg.chat.id, welcomeMsg);
+      });
+
+      adminBot.onText(/\/nall/, (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        userStates.set(msg.chat.id, { step: "admin_broadcast_msg", data: {} });
+        adminBot!.sendMessage(msg.chat.id, "📢 يرجى إدخال نص الإشعار العام:");
+      });
+
+      adminBot.onText(/\/nhe/, (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        userStates.set(msg.chat.id, { step: "admin_private_msg_pn", data: {} });
+        adminBot!.sendMessage(msg.chat.id, "👤 يرجى إدخال الرقم الشخصي للمستخدم:");
+      });
+
+      adminBot.onText(/\/topup/, (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        userStates.set(msg.chat.id, { step: "admin_manual_topup_pn", data: {} });
+        adminBot!.sendMessage(msg.chat.id, "💰 يرجى إدخال الرقم الشخصي للمستخدم لشحن رصيده:");
+      });
+
+      adminBot.onText(/\/block/, (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        userStates.set(msg.chat.id, { step: "admin_block_pn", data: {} });
+        adminBot!.sendMessage(msg.chat.id, "🚫 يرجى إدخال الرقم الشخصي للمستخدم لحظره مؤقتاً:");
+      });
+
+      adminBot.onText(/\/deli/, (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        userStates.set(msg.chat.id, { step: "admin_delete_user_pn", data: {} });
+        adminBot!.sendMessage(msg.chat.id, "🗑️ يرجى إدخال الرقم الشخصي للمستخدم لحذفه نهائياً:");
+      });
+
+      adminBot.onText(/\/vip/, (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        userStates.set(msg.chat.id, { step: "admin_grant_vip_pn", data: {} });
+        adminBot!.sendMessage(msg.chat.id, "💎 يرجى إدخال الرقم الشخصي للمستخدم لترقيته لـ VIP:");
+      });
+
+      adminBot.onText(/\/cat/, (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        userStates.set(msg.chat.id, { step: "admin_add_cat_name", data: {} });
+        adminBot!.sendMessage(msg.chat.id, "📁 يرجى إدخال اسم القسم الجديد:");
+      });
+
+      adminBot.onText(/\/sub(?!sub)/, async (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        const { data: cats } = await supabase.from("categories").select("id, name").eq("active", true).order("order_index");
+        if (!cats || cats.length === 0) return adminBot!.sendMessage(msg.chat.id, "❌ لا توجد أقسام رئيسية. أضف قسماً أولاً بـ /cat");
+        userStates.set(msg.chat.id, { step: "admin_add_sub_catid", data: {} });
+        const keyboard = cats.map((c: any) => [{ text: `📁 ${c.name}`, callback_data: `pick_cat_${c.id}` }]);
+        adminBot!.sendMessage(msg.chat.id, "📂 اختر القسم الرئيسي:", { reply_markup: { inline_keyboard: keyboard } });
+      });
+
+      adminBot.onText(/\/subsub/, async (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        const { data: subs } = await supabase.from("subcategories").select("id, name").eq("active", true).order("order_index");
+        if (!subs || subs.length === 0) return adminBot!.sendMessage(msg.chat.id, "❌ لا توجد أقسام فرعية. أضف قسماً فرعياً أولاً بـ /sub");
+        userStates.set(msg.chat.id, { step: "admin_add_subsub_subid", data: {} });
+        const keyboard = subs.map((s: any) => [{ text: `📂 ${s.name}`, callback_data: `pick_sub_${s.id}` }]);
+        adminBot!.sendMessage(msg.chat.id, "📂 اختر القسم الفرعي:", { reply_markup: { inline_keyboard: keyboard } });
+      });
+
+      adminBot.onText(/\/prod/, async (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        const { data: subs } = await supabase.from("subcategories").select("id, name").eq("active", true).order("order_index");
+        if (!subs || subs.length === 0) return adminBot!.sendMessage(msg.chat.id, "❌ لا توجد أقسام فرعية. أضف قسماً فرعياً أولاً بـ /sub");
+        userStates.set(msg.chat.id, { step: "admin_add_prod_subid", data: {} });
+        const keyboard = subs.map((s: any) => [{ text: `📂 ${s.name}`, callback_data: `pick_prodsub_${s.id}` }]);
+        adminBot!.sendMessage(msg.chat.id, "📦 اختر القسم الفرعي للمنتج:", { reply_markup: { inline_keyboard: keyboard } });
+      });
+
+      adminBot.onText(/\/editprice/, (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        userStates.set(msg.chat.id, { step: "admin_edit_price_id", data: {} });
+        adminBot!.sendMessage(msg.chat.id, "💰 يرجى إدخال ID المنتج لتعديل سعره:");
+      });
+
+      adminBot.onText(/\/banner/, (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        userStates.set(msg.chat.id, { step: "admin_add_banner_url", data: {} });
+        adminBot!.sendMessage(msg.chat.id, "🖼️ يرجى إدخال رابط صورة البانر:");
+      });
+
+      adminBot.onText(/\/offer/, (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        userStates.set(msg.chat.id, { step: "admin_add_offer_title", data: {} });
+        adminBot!.sendMessage(msg.chat.id, "🔥 يرجى إدخال عنوان العرض:");
+      });
+
+      adminBot.onText(/\/voucher/, (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        userStates.set(msg.chat.id, { step: "admin_add_voucher_code", data: {} });
+        adminBot!.sendMessage(msg.chat.id, "🎁 يرجى إدخال كود القسيمة:");
+      });
+
+      // دالة مساعدة لإرسال قائمة العناصر كأزرار
+      const sendDeleteList = async (chatId: number, table: string, labelField: string, title: string, step: string, extraFields: string = "") => {
+        const fields = `id, ${labelField}${extraFields ? ", " + extraFields : ""}`;
+        const { data: items } = await supabase.from(table).select(fields).order("id");
+        if (!items || items.length === 0) {
+          return adminBot!.sendMessage(chatId, `لا توجد عناصر في ${title}.`);
+        }
+        userStates.set(chatId, { step, data: {} });
+        const keyboard = items.map((item: any) => {
+          const label = item[labelField] || `ID: ${item.id}`;
+          return [{ text: `🗑️ ${label}`, callback_data: `del_select_${step}_${item.id}` }];
+        });
+        adminBot!.sendMessage(chatId, `🗑️ اختر ${title} المراد حذفه:`, {
+          reply_markup: { inline_keyboard: keyboard }
+        });
+      };
+
+      adminBot.onText(/\/delcat/, async (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        await sendDeleteList(msg.chat.id, "categories", "name", "القسم", "admin_del_cat_id");
+      });
+
+      adminBot.onText(/\/delsub/, async (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        await sendDeleteList(msg.chat.id, "subcategories", "name", "القسم الفرعي", "admin_del_sub_id");
+      });
+
+      adminBot.onText(/\/delsubsub/, async (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        await sendDeleteList(msg.chat.id, "sub_sub_categories", "name", "القسم الفرعي الفرعي", "admin_del_subsub_id");
+      });
+
+      adminBot.onText(/\/delprod/, async (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        await sendDeleteList(msg.chat.id, "products", "name", "المنتج", "admin_del_prod_id", "price");
+      });
+
+      adminBot.onText(/\/delbanner/, async (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        await sendDeleteList(msg.chat.id, "banners", "image_url", "البانر", "admin_del_banner_id");
+      });
+
+      adminBot.onText(/\/deloffer/, async (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        await sendDeleteList(msg.chat.id, "offers", "title", "العرض", "admin_del_offer_id");
+      });
+
+      adminBot.onText(/\/delvoucher/, async (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        await sendDeleteList(msg.chat.id, "vouchers", "code", "القسيمة", "admin_del_voucher_id");
+      });
+
+      adminBot.onText(/\/delpm/, async (msg) => {
+        if (msg.chat.id.toString() !== adminChatId) return;
+        await sendDeleteList(msg.chat.id, "payment_methods", "name", "طريقة الشحن", "admin_del_pm_id");
+      });
+
+      // Admin callback_query: Approve/Reject transactions & orders + Delete confirmations
+      adminBot.on("callback_query", async (query) => {
+        const chatId = query.message?.chat.id;
+        if (!chatId || chatId.toString() !== adminChatId) return;
+
+        const data = query.data;
+
+        // --- معالجة اختيار عنصر للحذف (عرض تأكيد نعم/إلغاء) ---
+        if (data?.startsWith("del_select_")) {
+          // format: del_select_{step}_{id}
+          const parts = data.split("_");
+          // step يمكن أن يحتوي على _ مثل admin_del_cat_id
+          // آخر جزء هو الـ id، وما قبله هو step
+          const itemId = parts[parts.length - 1];
+          const step = parts.slice(2, parts.length - 1).join("_");
+
+          // جلب اسم العنصر للتأكيد
+          const tableMap: any = {
+            "admin_del_cat_id": { table: "categories", field: "name", label: "القسم" },
+            "admin_del_sub_id": { table: "subcategories", field: "name", label: "القسم الفرعي" },
+            "admin_del_subsub_id": { table: "sub_sub_categories", field: "name", label: "القسم الفرعي الفرعي" },
+            "admin_del_prod_id": { table: "products", field: "name", label: "المنتج" },
+            "admin_del_banner_id": { table: "banners", field: "image_url", label: "البانر" },
+            "admin_del_offer_id": { table: "offers", field: "title", label: "العرض" },
+            "admin_del_voucher_id": { table: "vouchers", field: "code", label: "القسيمة" },
+            "admin_del_pm_id": { table: "payment_methods", field: "name", label: "طريقة الشحن" },
+          };
+
+          const info = tableMap[step];
+          if (!info) {
+            adminBot!.answerCallbackQuery(query.id);
+            return;
+          }
+
+          const { data: item } = await supabase.from(info.table).select(`id, ${info.field}`).eq("id", itemId).single();
+          const itemName = item ? item[info.field] : `ID: ${itemId}`;
+
+          adminBot!.sendMessage(chatId, `⚠️ هل تريد حذف ${info.label}؟
+
+📌 ${itemName}`, {
+            reply_markup: {
+              inline_keyboard: [[
+                { text: "✅ نعم، احذف", callback_data: `del_confirm_${step}_${itemId}` },
+                { text: "❌ إلغاء", callback_data: "del_cancel" }
+              ]]
+            }
+          });
+          adminBot!.answerCallbackQuery(query.id);
+          return;
+        }
+
+        // --- تنفيذ الحذف بعد التأكيد ---
+        if (data?.startsWith("del_confirm_")) {
+          const parts = data.split("_");
+          const itemId = parts[parts.length - 1];
+          const step = parts.slice(2, parts.length - 1).join("_");
+
+          const deleteMap: any = {
+            "admin_del_cat_id": async () => {
+              await supabase.from("categories").delete().eq("id", itemId);
+              return "✅ تم حذف القسم بنجاح.";
+            },
+            "admin_del_sub_id": async () => {
+              await supabase.from("subcategories").delete().eq("id", itemId);
+              return "✅ تم حذف القسم الفرعي بنجاح.";
+            },
+            "admin_del_subsub_id": async () => {
+              await supabase.from("sub_sub_categories").delete().eq("id", itemId);
+              return "✅ تم حذف القسم الفرعي الفرعي بنجاح.";
+            },
+            "admin_del_prod_id": async () => {
+              await supabase.from("products").delete().eq("id", itemId);
+              return "✅ تم حذف المنتج بنجاح.";
+            },
+            "admin_del_banner_id": async () => {
+              await supabase.from("banners").delete().eq("id", itemId);
+              return "✅ تم حذف البانر بنجاح.";
+            },
+            "admin_del_offer_id": async () => {
+              await supabase.from("offers").delete().eq("id", itemId);
+              return "✅ تم حذف العرض بنجاح.";
+            },
+            "admin_del_voucher_id": async () => {
+              await supabase.from("vouchers").delete().eq("id", itemId);
+              return "✅ تم حذف القسيمة بنجاح.";
+            },
+            "admin_del_pm_id": async () => {
+              const { data: txCount } = await supabase.from("transactions").select("id").eq("payment_method_id", itemId).limit(1);
+              if (txCount && txCount.length > 0) {
+                await supabase.from("payment_methods").update({ active: false }).eq("id", itemId);
+                return "⚠️ يوجد معاملات مرتبطة — تم تعطيل طريقة الشحن بدل الحذف.";
+              }
+              await supabase.from("payment_methods").delete().eq("id", itemId);
+              return "✅ تم حذف طريقة الشحن بنجاح.";
+            },
+          };
+
+          const handler = deleteMap[step];
+          if (handler) {
+            try {
+              const msg = await handler();
+              adminBot!.sendMessage(chatId, msg);
+            } catch (e) {
+              adminBot!.sendMessage(chatId, "❌ حدث خطأ أثناء الحذف.");
+            }
+          }
+          adminBot!.answerCallbackQuery(query.id);
+          userStates.delete(chatId);
+          return;
+        }
+
+        // --- إلغاء الحذف ---
+        if (data === "del_cancel") {
+          adminBot!.sendMessage(chatId, "❌ تم إلغاء عملية الحذف.");
+          adminBot!.answerCallbackQuery(query.id);
+          userStates.delete(chatId);
+          return;
+        }
+
+        // --- اختيار قسم رئيسي لإضافة قسم فرعي ---
+        if (data?.startsWith("pick_cat_")) {
+          const catId = data.split("_")[2];
+          const state = userStates.get(chatId);
+          if (state && state.step === "admin_add_sub_catid") {
+            const { data: cat } = await supabase.from("categories").select("name").eq("id", catId).single();
+            state.data.catId = catId;
+            state.step = "admin_add_sub_name";
+            adminBot!.sendMessage(chatId, `✅ القسم الرئيسي: ${cat?.name}
+📂 يرجى إدخال اسم القسم الفرعي:`);
+          }
+          adminBot!.answerCallbackQuery(query.id);
+          return;
+        }
+
+        // --- اختيار قسم فرعي لإضافة قسم فرعي فرعي ---
+        if (data?.startsWith("pick_sub_")) {
+          const subId = data.split("_")[2];
+          const state = userStates.get(chatId);
+          if (state && state.step === "admin_add_subsub_subid") {
+            const { data: sub } = await supabase.from("subcategories").select("name").eq("id", subId).single();
+            state.data.subId = subId;
+            state.step = "admin_add_subsub_name";
+            adminBot!.sendMessage(chatId, `✅ القسم الفرعي: ${sub?.name}
+📂 يرجى إدخال اسم القسم الفرعي الفرعي:`);
+          }
+          adminBot!.answerCallbackQuery(query.id);
+          return;
+        }
+
+        // --- اختيار قسم فرعي لإضافة منتج ---
+        if (data?.startsWith("pick_prodsub_")) {
+          const subId = data.split("_")[2];
+          const state = userStates.get(chatId);
+          if (state && state.step === "admin_add_prod_subid") {
+            const { data: sub } = await supabase.from("subcategories").select("name").eq("id", subId).single();
+            state.data.subId = subId;
+            state.step = "admin_add_prod_subsubid";
+            // عرض الأقسام الفرعية الفرعية كأزرار أيضاً
+            const { data: subsubs } = await supabase.from("sub_sub_categories").select("id, name").eq("subcategory_id", subId).eq("active", true);
+            if (subsubs && subsubs.length > 0) {
+              const keyboard = subsubs.map((ss: any) => [{ text: `📂 ${ss.name}`, callback_data: `pick_subsub_${ss.id}` }]);
+              keyboard.push([{ text: "⬆️ بدون قسم فرعي فرعي", callback_data: "pick_subsub_0" }]);
+              adminBot!.sendMessage(chatId, `✅ القسم الفرعي: ${sub?.name}
+📂 اختر القسم الفرعي الفرعي (أو بدون):`, { reply_markup: { inline_keyboard: keyboard } });
+            } else {
+              state.data.subSubId = null;
+              state.step = "admin_add_prod_name";
+              adminBot!.sendMessage(chatId, `✅ القسم الفرعي: ${sub?.name}
+📦 يرجى إدخال اسم المنتج:`);
+            }
+          }
+          adminBot!.answerCallbackQuery(query.id);
+          return;
+        }
+
+        // --- اختيار قسم فرعي فرعي للمنتج ---
+        if (data?.startsWith("pick_subsub_")) {
+          const ssId = data.split("_")[2];
+          const state = userStates.get(chatId);
+          if (state && state.step === "admin_add_prod_subsubid") {
+            state.data.subSubId = ssId === "0" ? null : ssId;
+            state.step = "admin_add_prod_name";
+            adminBot!.sendMessage(chatId, "📦 يرجى إدخال اسم المنتج:");
+          }
+          adminBot!.answerCallbackQuery(query.id);
+          return;
+        }
+
+        if (data?.startsWith("approve_tx_")) {
+          const txId = data.split("_")[2];
+          const { data: tx } = await supabase.from("transactions").select("*").eq("id", txId).single();
+          if (tx && tx.status === "pending") {
+            await supabase.from("transactions").update({ status: "completed" }).eq("id", txId);
+            await supabase.rpc("increment_balance", { user_id_param: tx.user_id, amount_param: tx.amount });
+            await supabase.from("user_stats").update({ total_recharge_sum: tx.amount }).eq("user_id", tx.user_id);
+
+            const { data: user } = await supabase.from("users").select("telegram_chat_id").eq("id", tx.user_id).single();
+            if (user?.telegram_chat_id) {
+              userBot?.sendMessage(user.telegram_chat_id, `✅ تم قبول طلب الشحن الخاص بك! تم إضافة ${tx.amount}$ لرصيدك.`);
+            }
+            adminBot!.sendMessage(chatId, `✅ تم قبول العملية #TX${txId} بنجاح.`);
+          }
+        } else if (data?.startsWith("reject_tx_")) {
+          const txId = data.split("_")[2];
+          const { data: tx } = await supabase.from("transactions").select("user_id").eq("id", txId).single();
+          await supabase.from("transactions").update({ status: "rejected" }).eq("id", txId);
+          if (tx?.user_id) {
+            const { data: user } = await supabase.from("users").select("telegram_chat_id").eq("id", tx.user_id).single();
+            if (user?.telegram_chat_id) {
+              userBot?.sendMessage(user.telegram_chat_id, `❌ تم رفض طلب الشحن الخاص بك. يرجى التواصل مع الدعم الفني.`);
+            }
+          }
+          adminBot!.sendMessage(chatId, `❌ تم رفض العملية #TX${txId}.`);
+        }
+
+        adminBot!.answerCallbackQuery(query.id);
+      });
+
+      // Admin message handler (state machine)
+      adminBot.on("message", async (msg: any) => {
+        const chatId = msg.chat.id;
+        if (chatId.toString() !== adminChatId) return;
+        const text = msg.text || "";
+
+        // Handle replies to transaction/order notifications
+        if (msg.reply_to_message) {
+          const replyToText = msg.reply_to_message.text || "";
+          const txMatch = replyToText.match(/#TX(\d+)/);
+          const ordMatch = replyToText.match(/#ORD(\d+)/);
+
+          if (txMatch) {
+            const txId = txMatch[1];
+            if (text === "تم") {
+              const { data: tx } = await supabase.from("transactions").select("*").eq("id", txId).single();
+              if (tx && tx.status === "pending") {
+                await supabase.from("transactions").update({ status: "approved" }).eq("id", txId);
+                await supabase.rpc("increment_balance", { user_id_param: tx.user_id, amount_param: tx.amount });
+                const { data: user } = await supabase.from("users").select("telegram_chat_id").eq("id", tx.user_id).single();
+                if (user?.telegram_chat_id) {
+                  userBot?.sendMessage(user.telegram_chat_id, `✅ تم قبول طلب الشحن الخاص بك! تم إضافة ${tx.amount}$ لرصيدك.`);
+                }
+                adminBot!.sendMessage(chatId, `✅ تم قبول الشحن #TX${txId}`);
+              }
+            } else if (text === "رفض") {
+              await supabase.from("transactions").update({ status: "rejected" }).eq("id", txId);
+              adminBot!.sendMessage(chatId, `❌ تم رفض الشحن #TX${txId}`);
+            }
+          } else if (ordMatch) {
+            const ordId = ordMatch[1];
+            const { data: order } = await supabase.from("orders").select("*").eq("id", ordId).single();
+            if (order) {
+              if (text === "تم") {
+                await supabase.from("orders").update({ status: "accepted" }).eq("id", ordId);
+                const { data: user } = await supabase.from("users").select("telegram_chat_id").eq("id", order.user_id).single();
+                if (user?.telegram_chat_id) userBot?.sendMessage(user.telegram_chat_id, `✅ تم قبول طلبك #${ordId}`);
+                adminBot!.sendMessage(chatId, `✅ تم قبول الطلب #ORD${ordId}`);
+              } else if (text === "رفض") {
+                await supabase.from("orders").update({ status: "rejected" }).eq("id", ordId);
+                adminBot!.sendMessage(chatId, `❌ تم رفض الطلب #ORD${ordId}`);
+              } else {
+                await supabase.from("orders").update({ admin_response: text }).eq("id", ordId);
+                const { data: user } = await supabase.from("users").select("telegram_chat_id").eq("id", order.user_id).single();
+                if (user?.telegram_chat_id) userBot?.sendMessage(user.telegram_chat_id, `🔔 وصلك رد جديد على طلبك #${ordId}:\n\n${text}`);
+                adminBot!.sendMessage(chatId, `✅ تم إرسال الرد للطلب #ORD${ordId}`);
+              }
+            }
+          }
+          return;
+        }
+
+        if (text.startsWith("/")) return;
+
+        const state = userStates.get(chatId);
+        if (!state) return;
+
+        if (state.step === "admin_broadcast_msg") {
+          await supabase.from("notifications").insert({ title: "إعلان جديد", message: text, type: "info" });
+          sendPushNotification(null, "إعلان جديد", text);
+          const { data: users } = await supabase.from("users").select("telegram_chat_id").not("telegram_chat_id", "is", null);
+          users?.forEach(u => userBot?.sendMessage(u.telegram_chat_id, `🔔 إعلان جديد:\n\n${text}`));
+          userStates.delete(chatId);
+          adminBot!.sendMessage(chatId, "✅ تم إرسال الإشعار للجميع.");
+
+        } else if (state.step === "admin_private_msg_pn") {
+          const { data: user } = await supabase.from("users").select("id").eq("personal_number", text).single();
+          if (!user) return adminBot!.sendMessage(chatId, "❌ المستخدم غير موجود.");
+          state.data.pn = text;
+          state.step = "admin_private_msg_text";
+          adminBot!.sendMessage(chatId, "✅ تم التحقق. يرجى إدخال نص الرسالة:");
+
+        } else if (state.step === "admin_private_msg_text") {
+          const { data: user } = await supabase.from("users").select("id, telegram_chat_id").eq("personal_number", state.data.pn).single();
+          if (user) {
+            await supabase.from("notifications").insert({ user_id: user.id, title: "تنبيه خاص", message: text, type: "warning" });
+            sendPushNotification(user.id, "تنبيه خاص", text);
+            if (user.telegram_chat_id) userBot?.sendMessage(user.telegram_chat_id, `🔔 تنبيه خاص:\n\n${text}`);
+          }
+          userStates.delete(chatId);
+          adminBot!.sendMessage(chatId, "✅ تم إرسال الإشعار للمستخدم.");
+
+        } else if (state.step === "admin_manual_topup_pn") {
+          const { data: user } = await supabase.from("users").select("id, name").eq("personal_number", text).single();
+          if (!user) return adminBot!.sendMessage(chatId, "❌ المستخدم غير موجود.");
+          state.data.pn = text;
+          state.data.userName = user.name;
+          state.step = "admin_manual_topup_amount";
+          adminBot!.sendMessage(chatId, `✅ تم التحقق: ${user.name}\nيرجى إدخال مبلغ الشحن ($):`);
+
+        } else if (state.step === "admin_manual_topup_amount") {
+          const amount = parseFloat(text);
+          if (isNaN(amount)) return adminBot!.sendMessage(chatId, "❌ يرجى إدخال مبلغ صحيح:");
+          const { data: user } = await supabase.from("users").select("id").eq("personal_number", state.data.pn).single();
+          if (user) {
+            await supabase.rpc("increment_balance", { user_id_param: user.id, amount_param: amount });
+          }
+          userStates.delete(chatId);
+          adminBot!.sendMessage(chatId, `✅ تم شحن ${amount}$ للمستخدم ${state.data.userName} بنجاح.`);
+
+        } else if (state.step === "admin_block_pn") {
+          const { data: user } = await supabase.from("users").select("id, name").eq("personal_number", text).single();
+          if (!user) return adminBot!.sendMessage(chatId, "❌ المستخدم غير موجود.");
+          state.data.pn = text;
+          state.data.userName = user.name;
+          state.step = "admin_block_minutes";
+          adminBot!.sendMessage(chatId, `✅ تم التحقق: ${user.name}\nيرجى إدخال مدة الحظر بالدقائق:`);
+
+        } else if (state.step === "admin_block_minutes") {
+          const minutes = parseInt(text);
+          if (isNaN(minutes)) return adminBot!.sendMessage(chatId, "❌ يرجى إدخال رقم صحيح:");
+          const { data: user } = await supabase.from("users").select("id").eq("personal_number", state.data.pn).single();
+          if (user) {
+            const blockedUntil = new Date(Date.now() + minutes * 60000).toISOString();
+            await supabase.from("users").update({ blocked_until: blockedUntil, is_banned: true }).eq("id", user.id);
+          }
+          userStates.delete(chatId);
+          adminBot!.sendMessage(chatId, `✅ تم حظر المستخدم ${state.data.userName} لمدة ${minutes} دقيقة.`);
+
+        } else if (state.step === "admin_delete_user_pn") {
+          const { data: user } = await supabase.from("users").select("id, name").eq("personal_number", text).single();
+          if (!user) return adminBot!.sendMessage(chatId, "❌ المستخدم غير موجود.");
+          state.data.userId = user.id;
+          state.data.userName = user.name;
+          state.step = "admin_delete_user_confirm";
+          adminBot!.sendMessage(chatId, `⚠️ هل أنت متأكد من حذف المستخدم ${user.name} نهائياً؟\nأرسل "نعم" للتأكيد:`);
+
+        } else if (state.step === "admin_delete_user_confirm") {
+          if (text === "نعم") {
+            try {
+              await deleteUserCompletely(state.data.userId);
+              adminBot!.sendMessage(chatId, `✅ تم حذف المستخدم ${state.data.userName} وكافة بياناته نهائياً.`);
+            } catch (e) {
+              adminBot!.sendMessage(chatId, "❌ حدث خطأ أثناء الحذف.");
+              console.error("Bot delete user error:", e);
+            }
+          } else {
+            adminBot!.sendMessage(chatId, "❌ تم إلغاء عملية الحذف.");
+          }
+          userStates.delete(chatId);
+
+        } else if (state.step === "admin_grant_vip_pn") {
+          const { data: user } = await supabase.from("users").select("id, name").eq("personal_number", text).single();
+          if (!user) return adminBot!.sendMessage(chatId, "❌ المستخدم غير موجود.");
+          await supabase.from("users").update({ is_vip: true }).eq("id", user.id);
+          userStates.delete(chatId);
+          adminBot!.sendMessage(chatId, `✅ تم ترقية المستخدم ${user.name} لـ VIP بنجاح.`);
+
+        } else if (state.step === "admin_add_cat_name") {
+          state.data.name = text;
+          state.step = "admin_add_cat_url";
+          adminBot!.sendMessage(chatId, "🖼️ يرجى إدخال رابط صورة القسم:");
+
+        } else if (state.step === "admin_add_cat_url") {
+          const { data: cat } = await supabase.from("categories").insert({ name: state.data.name, image_url: text, active: true, order_index: 0 }).select().single();
+          userStates.delete(chatId);
+          adminBot!.sendMessage(chatId, `✅ تم إضافة القسم بنجاح! ID: ${cat?.id}`);
+
+        } else if (state.step === "admin_add_sub_catid") {
+          // fallback: كتابة ID يدوياً
+          const { data: cat } = await supabase.from("categories").select("id, name").eq("id", text).single();
+          if (!cat) return adminBot!.sendMessage(chatId, "❌ القسم غير موجود. يرجى اختيار قسم من الأزرار.");
+          state.data.catId = text;
+          state.step = "admin_add_sub_name";
+          adminBot!.sendMessage(chatId, `✅ القسم: ${cat.name}
+📂 يرجى إدخال اسم القسم الفرعي:`);
+
+        } else if (state.step === "admin_add_sub_name") {
+          state.data.name = text;
+          state.step = "admin_add_sub_url";
+          adminBot!.sendMessage(chatId, "🖼️ يرجى إدخال رابط صورة القسم الفرعي:");
+
+        } else if (state.step === "admin_add_sub_url") {
+          const { data: sub } = await supabase.from("subcategories").insert({ category_id: state.data.catId, name: state.data.name, image_url: text, active: true, order_index: 0 }).select().single();
+          userStates.delete(chatId);
+          adminBot!.sendMessage(chatId, `✅ تم إضافة القسم الفرعي بنجاح! ID: ${sub?.id}`);
+
+        } else if (state.step === "admin_add_subsub_subid") {
+          state.data.subId = text;
+          state.step = "admin_add_subsub_name";
+          adminBot!.sendMessage(chatId, "📂 يرجى إدخال اسم القسم الفرعي الفرعي:");
+
+        } else if (state.step === "admin_add_subsub_name") {
+          state.data.name = text;
+          state.step = "admin_add_subsub_url";
+          adminBot!.sendMessage(chatId, "🖼️ يرجى إدخال رابط صورة القسم الفرعي الفرعي:");
+
+        } else if (state.step === "admin_add_subsub_url") {
+          const { data: ss } = await supabase.from("sub_sub_categories").insert({ subcategory_id: state.data.subId, name: state.data.name, image_url: text, active: true, order_index: 0 }).select().single();
+          userStates.delete(chatId);
+          adminBot!.sendMessage(chatId, `✅ تم إضافة القسم الفرعي الفرعي بنجاح! ID: ${ss?.id}`);
+
+        } else if (state.step === "admin_add_prod_subid") {
+          state.data.subId = text;
+          state.step = "admin_add_prod_subsubid";
+          adminBot!.sendMessage(chatId, "📂 يرجى إدخال ID القسم الفرعي الفرعي (أو أرسل 0 إذا لم يوجد):");
+
+        } else if (state.step === "admin_add_prod_subsubid") {
+          state.data.subSubId = text === "0" ? null : text;
+          state.step = "admin_add_prod_name";
+          adminBot!.sendMessage(chatId, "📦 يرجى إدخال اسم المنتج:");
+
+        } else if (state.step === "admin_add_prod_name") {
+          state.data.name = text;
+          state.step = "admin_add_prod_price";
+          adminBot!.sendMessage(chatId, "💰 يرجى إدخال سعر المنتج:");
+
+        } else if (state.step === "admin_add_prod_price") {
+          state.data.price = parseFloat(text);
+          state.step = "admin_add_prod_desc";
+          adminBot!.sendMessage(chatId, "📝 يرجى إدخال وصف المنتج:");
+
+        } else if (state.step === "admin_add_prod_desc") {
+          state.data.description = text;
+          state.step = "admin_add_prod_url";
+          adminBot!.sendMessage(chatId, "🖼️ يرجى إدخال رابط صورة المنتج:");
+
+        } else if (state.step === "admin_add_prod_url") {
+          const { data: prod } = await supabase.from("products").insert({
+            subcategory_id: state.data.subId,
+            sub_sub_category_id: state.data.subSubId,
+            name: state.data.name,
+            price: state.data.price,
+            description: state.data.description,
+            image_url: text,
+            available: true,
+            store_type: 'normal'
+          }).select().single();
+          userStates.delete(chatId);
+          adminBot!.sendMessage(chatId, `✅ تم إضافة المنتج بنجاح! ID: ${prod?.id}`);
+
+        } else if (state.step === "admin_edit_price_id") {
+          const { data: product } = await supabase.from("products").select("id, name, price").eq("id", text).single();
+          if (!product) return adminBot!.sendMessage(chatId, "❌ المنتج غير موجود.");
+          state.data.prodId = text;
+          state.data.oldPrice = product.price;
+          state.step = "admin_edit_price_new";
+          adminBot!.sendMessage(chatId, `💰 المنتج: ${product.name}\nالسعر الحالي: ${product.price}$\n\nيرجى إدخال السعر الجديد:`);
+
+        } else if (state.step === "admin_edit_price_new") {
+          const newPrice = parseFloat(text);
+          if (isNaN(newPrice)) return adminBot!.sendMessage(chatId, "❌ يرجى إدخال سعر صحيح:");
+          await supabase.from("products").update({ price: newPrice }).eq("id", state.data.prodId);
+          userStates.delete(chatId);
+          adminBot!.sendMessage(chatId, `✅ تم تحديث السعر من ${state.data.oldPrice}$ إلى ${newPrice}$`);
+
+        } else if (state.step === "admin_add_banner_url") {
+          const { data: banner } = await supabase.from("banners").insert({ image_url: text }).select().single();
+          userStates.delete(chatId);
+          adminBot!.sendMessage(chatId, `✅ تم إضافة البانر بنجاح! ID: ${banner?.id}`);
+
+        } else if (state.step === "admin_add_offer_title") {
+          state.data.title = text;
+          state.step = "admin_add_offer_desc";
+          adminBot!.sendMessage(chatId, "📝 يرجى إدخال وصف العرض:");
+
+        } else if (state.step === "admin_add_offer_desc") {
+          state.data.description = text;
+          state.step = "admin_add_offer_url";
+          adminBot!.sendMessage(chatId, "🖼️ يرجى إدخال رابط صورة العرض:");
+
+        } else if (state.step === "admin_add_offer_url") {
+          const { data: offer } = await supabase.from("offers").insert({ title: state.data.title, description: state.data.description, image_url: text }).select().single();
+          userStates.delete(chatId);
+          adminBot!.sendMessage(chatId, `✅ تم إضافة العرض بنجاح! ID: ${offer?.id}`);
+
+        } else if (state.step === "admin_add_voucher_code") {
+          state.data.code = text;
+          state.step = "admin_add_voucher_amount";
+          adminBot!.sendMessage(chatId, "💰 يرجى إدخال مبلغ القسيمة:");
+
+        } else if (state.step === "admin_add_voucher_amount") {
+          state.data.amount = parseFloat(text);
+          state.step = "admin_add_voucher_uses";
+          adminBot!.sendMessage(chatId, "🔢 يرجى إدخال أقصى عدد للاستخدامات:");
+
+        } else if (state.step === "admin_add_voucher_uses") {
+          const { data: v } = await supabase.from("vouchers").insert({ code: state.data.code, amount: state.data.amount, max_uses: parseInt(text) }).select().single();
+          userStates.delete(chatId);
+          adminBot!.sendMessage(chatId, `✅ تم إضافة القسيمة بنجاح! ID: ${v?.id}`);
+
+        }
+        // حالات الحذف بعد كتابة ID يدوياً (fallback)
+        // هذه الحالات تُعالج الآن عبر callback_query
+      });
+
+    } catch (e) {
+      console.error("Failed to start Admin Bot:", e);
+    }
+  }
+
+  // ====== USER BOT ======
+  const userBotToken = process.env.TELEGRAM_USER_BOT_TOKEN;
+  if (!userBotToken) {
+    console.warn("TELEGRAM_USER_BOT_TOKEN is not defined. User bot will not start.");
+    return;
+  }
+
+  try {
+    userBot = new TelegramBot(userBotToken, {
+      polling: { autoStart: true, params: { timeout: 10 } }
+    });
+
+    userBot.on("polling_error", (error: any) => {
+      if (error.message.includes("409 Conflict")) {
+        console.warn("User Bot polling conflict. Ignoring.");
+      } else {
+        console.error("User Bot polling error:", error);
+      }
+    });
+
+    // /start
+    userBot.onText(/\/start(?:\s+(.+))?/, async (msg, match) => {
+      const chatId = msg.chat.id;
+      const startParam = match?.[1];
+      userStates.delete(chatId);
+
+      if (startParam) {
+        // Linking code
+        const now = new Date().toISOString();
+        const { data: linkingCode } = await supabase.from("telegram_linking_codes").select("*").eq("code", startParam).gt("expires_at", now).single();
+        if (linkingCode) {
+          await supabase.from("users").update({ telegram_chat_id: chatId }).eq("id", linkingCode.user_id);
+          await supabase.from("telegram_linking_codes").delete().eq("id", linkingCode.id);
+          const { data: user } = await supabase.from("users").select("*").eq("id", linkingCode.user_id).single();
+          userBot!.sendMessage(chatId, "✅ تم ربط حسابك بنجاح!");
+          if (user) sendMainMenu(chatId, user, userBot!);
+          return;
+        }
+
+        // Referral code
+        const { data: referrer } = await supabase.from("users").select("id").eq("personal_number", startParam).single();
+        if (referrer) {
+          userStates.set(chatId, { step: "register_name", data: { referralCode: startParam } });
+          userBot!.sendMessage(chatId, `مرحباً بك! لقد تمت دعوتك.\nيرجى إدخال اسمك الكامل لإنشاء حساب:`);
+          return;
+        }
+      }
+
+      const { data: user } = await supabase.from("users").select("*").eq("telegram_chat_id", chatId).single();
+      if (user) {
+        sendMainMenu(chatId, user, userBot!);
+      } else {
+        userBot!.sendMessage(chatId, "مرحباً بك في متجر فيبرو! 🛒\nيرجى تسجيل الدخول أو إنشاء حساب:", {
+          reply_markup: {
+            inline_keyboard: [
+              [{ text: "تسجيل الدخول", callback_data: "login" }],
+              [{ text: "إنشاء حساب جديد", callback_data: "register" }],
+              [{ text: "تسجيل عبر كود الربط", callback_data: "login_with_code" }]
+            ]
+          }
+        });
+      }
+    });
+
+    // User bot callback_query
+    userBot.on("callback_query", async (query) => {
+      const chatId = query.message?.chat.id;
+      if (!chatId) return;
+      const data = query.data;
+
+      userBot!.answerCallbackQuery(query.id);
+
+      if (data === "login") {
+        userStates.set(chatId, { step: "login_email", data: {} });
+        userBot!.sendMessage(chatId, "يرجى إدخال البريد الإلكتروني:");
+
+      } else if (data === "register") {
+        userStates.set(chatId, { step: "register_name", data: {} });
+        userBot!.sendMessage(chatId, "يرجى إدخال اسمك الكامل:");
+
+      } else if (data === "login_with_code") {
+        userStates.set(chatId, { step: "login_with_code", data: {} });
+        userBot!.sendMessage(chatId, "🆔 يرجى إدخال كود الربط المؤقت من الموقع:");
+
+      } else if (data === "main_menu") {
+        const { data: user } = await supabase.from("users").select("*").eq("telegram_chat_id", chatId).single();
+        if (user) sendMainMenu(chatId, user, userBot!);
+
+      } else if (data === "my_info") {
+        const { data: user } = await supabase.from("users").select("*").eq("telegram_chat_id", chatId).single();
+        if (!user) return userBot!.sendMessage(chatId, "يرجى تسجيل الدخول أولاً.");
+        userBot!.sendMessage(chatId, `👤 معلوماتي:\nالاسم: ${user.name}\nالإيميل: ${user.email}\nرقم الدخول: ${user.id}\nالرقم الشخصي: ${user.personal_number}\nالحالة: ${user.is_vip ? "VIP 💎" : "عادي"}`);
+
+      } else if (data === "my_balance") {
+        const { data: user } = await supabase.from("users").select("balance").eq("telegram_chat_id", chatId).single();
+        userBot!.sendMessage(chatId, `💰 رصيدك الحالي هو: ${(user?.balance || 0).toFixed(2)} $`);
+
+      } else if (data === "my_orders") {
+        const { data: user } = await supabase.from("users").select("id").eq("telegram_chat_id", chatId).single();
+        if (!user) return;
+        const { data: orders } = await supabase.from("orders").select("id, total_amount, status, order_items(products(name))").eq("user_id", user.id).order("created_at", { ascending: false }).limit(5);
+        if (!orders || orders.length === 0) return userBot!.sendMessage(chatId, "ليس لديك طلبات سابقة.");
+        let text = "📦 آخر 5 طلبات لك:\n\n";
+        orders.forEach((o: any) => {
+          const productName = o.order_items?.[0]?.products?.name || "منتج";
+          text += `🔹 طلب #${o.id}\nالمنتج: ${productName}\nالمبلغ: ${o.total_amount}$\nالحالة: ${o.status}\n\n`;
+        });
+        userBot!.sendMessage(chatId, text);
+
+      } else if (data === "my_payments") {
+        const { data: user } = await supabase.from("users").select("id").eq("telegram_chat_id", chatId).single();
+        if (!user) return;
+        const { data: txs } = await supabase.from("transactions").select("id, amount, status, payment_methods(name)").eq("user_id", user.id).order("created_at", { ascending: false }).limit(5);
+        if (!txs || txs.length === 0) return userBot!.sendMessage(chatId, "ليس لديك عمليات شحن سابقة.");
+        let text = "💳 آخر 5 عمليات شحن لك:\n\n";
+        txs.forEach((t: any) => {
+          text += `🔹 شحن #${t.id}\nالمبلغ: ${t.amount}$\nالطريقة: ${t.payment_methods?.name || "-"}\nالحالة: ${t.status}\n\n`;
+        });
+        userBot!.sendMessage(chatId, text);
+
+      } else if (data === "referral") {
+        const { data: user } = await supabase.from("users").select("id, personal_number").eq("telegram_chat_id", chatId).single();
+        if (!user) return;
+        const { data: referrals } = await supabase.from("users").select("id").eq("referred_by_id", user.id);
+        const count = referrals?.length || 0;
+        const botInfo = await userBot!.getMe();
+        const referralLink = `https://t.me/${botInfo.username}?start=${user.personal_number}`;
+        userBot!.sendMessage(chatId, `🔗 نظام الإحالة:\n\nرابط الإحالة الخاص بك:\n${referralLink}\n\nعدد المستخدمين المسجلين عبر رابطك: ${count}\n\nتحصل على عمولة 5% عن كل عملية شراء!`);
+
+      } else if (data === "share") {
+        const { data: user } = await supabase.from("users").select("personal_number").eq("telegram_chat_id", chatId).single();
+        if (!user) return;
+        const botInfo = await userBot!.getMe();
+        const referralLink = `https://t.me/${botInfo.username}?start=${user.personal_number}`;
+        userBot!.sendMessage(chatId, "شارك البوت مع أصدقائك واحصل على عمولات!", {
+          reply_markup: {
+            inline_keyboard: [[{
+              text: "مشاركة الرابط",
+              url: `https://t.me/share/url?url=${encodeURIComponent(referralLink)}&text=${encodeURIComponent("اشحن ألعابك وتطبيقاتك المفضلة!")}`
+            }]]
+          }
+        });
+
+      } else if (data === "offers") {
+        const { data: offers } = await supabase.from("offers").select("*").eq("active", true);
+        if (!offers || offers.length === 0) return userBot!.sendMessage(chatId, "لا توجد عروض حالياً.");
+        offers.forEach((o: any) => {
+          userBot!.sendMessage(chatId, `🔥 ${o.title}\n${o.description}`, {
+            reply_markup: { inline_keyboard: [[{ text: "عرض الصورة", url: o.image_url }]] }
+          });
+        });
+
+      } else if (data === "privacy_policy") {
+        const { data: setting } = await supabase.from("settings").select("value").eq("key", "privacy_policy").single();
+        userBot!.sendMessage(chatId, `📄 سياسة الخصوصية:\n\n${setting?.value || "لا توجد سياسة حالياً."}`);
+
+      } else if (data === "redeem_voucher") {
+        userStates.set(chatId, { step: "redeem_voucher_code", data: {} });
+        userBot!.sendMessage(chatId, "يرجى إدخال كود القسيمة:");
+
+      } else if (data === "logout_bot") {
+        await supabase.from("users").update({ telegram_chat_id: null }).eq("telegram_chat_id", chatId);
+        userBot!.sendMessage(chatId, "👋 تم تسجيل الخروج بنجاح. يمكنك العودة في أي وقت!");
+
+      } else if (data === "rewards") {
+        const { data: user } = await supabase.from("users").select("id").eq("telegram_chat_id", chatId).single();
+        if (!user) return;
+        const { data: stats } = await supabase.from("user_stats").select("*").eq("user_id", user.id).single();
+        const goals = [5, 15, 30, 50, 100, 200, 500];
+        const rewards = [
+          "خصم 1% لمدة شهر",
+          "1$ رصيد + خصم 2% لمدة شهر",
+          "3$ رصيد + خصم 4% لمدة شهر + كوبون 10%",
+          "5$ رصيد + خصم 5% لمدة سنة",
+          "5$ رصيد + خصم 7% + كوبون 15% + شارة فضية",
+          "10$ رصيد + خصم 10% + كوبون 15% + شارة ذهبية",
+          "20$ رصيد + خصم 10% + كوبون 20% + شارة ذهبية أسطورية + دعم خاص"
+        ];
+
+        let text = `🎁 نظام المكافآت:\n\nإجمالي شحنك: ${(stats?.total_recharge_sum || 0).toFixed(2)}$\n\n`;
+        const keyboard: any[] = [];
+
+        for (let i = 0; i < goals.length; i++) {
+          const isClaimed = (stats?.claimed_reward_index ?? -1) >= i;
+          const canClaim = (stats?.total_recharge_sum || 0) >= goals[i] && (stats?.claimed_reward_index ?? -1) === i - 1;
+          const remaining = (goals[i] - (stats?.total_recharge_sum || 0)).toFixed(2);
+          const status = isClaimed ? "✅ تم الاستلام" : ((stats?.total_recharge_sum || 0) >= goals[i] ? "🔓 جاهز للاستلام" : `🔒 يتبقى ${remaining}$`);
+          text += `${i + 1}. هدف ${goals[i]}$:\n🎁 ${rewards[i]}\nالحالة: ${status}\n\n`;
+          if (canClaim) keyboard.push([{ text: `🎁 استلام مكافأة ${goals[i]}$`, callback_data: `claim_reward_${i}` }]);
+        }
+        keyboard.push([{ text: "الرجوع للقائمة الرئيسية", callback_data: "main_menu" }]);
+        userBot!.sendMessage(chatId, text, { reply_markup: { inline_keyboard: keyboard } });
+
+      } else if (data?.startsWith("claim_reward_")) {
+        const goalIndex = parseInt(data.split("_")[2]);
+        const { data: user } = await supabase.from("users").select("id").eq("telegram_chat_id", chatId).single();
+        if (!user) return;
+        const { data: stats } = await supabase.from("user_stats").select("*").eq("user_id", user.id).single();
+        const goals = [5, 15, 30, 50, 100, 200, 500];
+
+        if ((stats?.claimed_reward_index ?? -1) >= goalIndex) return userBot!.sendMessage(chatId, "❌ لقد استلمت هذه المكافأة مسبقاً.");
+        if ((stats?.total_recharge_sum || 0) < goals[goalIndex]) return userBot!.sendMessage(chatId, "❌ لم تصل لهذا الهدف بعد.");
+        if (goalIndex > 0 && (stats?.claimed_reward_index ?? -1) < goalIndex - 1) return userBot!.sendMessage(chatId, "❌ يرجى استلام المكافآت السابقة أولاً.");
+
+        try {
+          await applyReward(user.id, goalIndex);
+          userBot!.sendMessage(chatId, `✅ تم استلام مكافأة هدف ${goals[goalIndex]}$ بنجاح!`);
+        } catch (e) {
+          userBot!.sendMessage(chatId, "❌ حدث خطأ أثناء استلام المكافأة.");
+        }
+
+      } else if (data === "topup_balance") {
+        const { data: user } = await supabase.from("users").select("id").eq("telegram_chat_id", chatId).single();
+        if (!user) return userBot!.sendMessage(chatId, "يرجى تسجيل الدخول أولاً.");
+
+        const { data: pending } = await supabase.from("transactions").select("id").eq("user_id", user.id).eq("status", "pending");
+        if ((pending?.length || 0) >= 2) return userBot!.sendMessage(chatId, "⚠️ لا يمكنك إرسال أكثر من مدفوعتين قيد المراجعة.");
+
+        const { data: methods } = await supabase.from("payment_methods").select("*").eq("active", true);
+        if (!methods || methods.length === 0) return userBot!.sendMessage(chatId, "لا توجد طرق دفع متاحة حالياً.");
+        const keyboard = methods.map((m: any) => [{ text: m.name, callback_data: `topup_method_${m.id}` }]);
+        userBot!.sendMessage(chatId, "اختر طريقة الدفع:", { reply_markup: { inline_keyboard: keyboard } });
+
+      } else if (data?.startsWith("topup_method_")) {
+        const methodId = data.split("_")[2];
+        const { data: method } = await supabase.from("payment_methods").select("*").eq("id", methodId).single();
+        userStates.set(chatId, { step: "topup_amount", data: { methodId } });
+        userBot!.sendMessage(chatId, `💳 طريقة الدفع: ${method?.name}\nالعنوان: ${method?.wallet_address}\nالحد الأدنى: ${method?.min_amount} $\n\n${method?.instructions || ""}\n\nيرجى إدخال المبلغ المراد شحنه ($):`);
+
+      } else if (data === "charge_apps") {
+        const { data: categories } = await supabase.from("categories").select("*").eq("active", true).order("order_index");
+        if (!categories || categories.length === 0) return userBot!.sendMessage(chatId, "لا توجد أقسام متاحة.");
+        const keyboard = categories.map((c: any) => [{ text: c.name, callback_data: `cat_${c.id}` }]);
+        userBot!.sendMessage(chatId, "اختر القسم:", { reply_markup: { inline_keyboard: keyboard } });
+
+      } else if (data?.startsWith("cat_")) {
+        const catId = data.split("_")[1];
+        const { data: subs } = await supabase.from("subcategories").select("*").eq("category_id", catId).eq("active", true);
+        if (!subs || subs.length === 0) return userBot!.sendMessage(chatId, "لا توجد أقسام فرعية.");
+        const keyboard = subs.map((s: any) => [{ text: s.name, callback_data: `sub_${s.id}` }]);
+        userBot!.sendMessage(chatId, "اختر القسم الفرعي:", { reply_markup: { inline_keyboard: keyboard } });
+
+      } else if (data?.startsWith("sub_")) {
+        const subId = data.split("_")[1];
+        const { data: products } = await supabase.from("products").select("*").eq("subcategory_id", subId).eq("available", true);
+        if (!products || products.length === 0) return userBot!.sendMessage(chatId, "لا توجد منتجات متاحة.");
+        const keyboard = products.map((p: any) => [{ text: `${p.name} - ${p.price}$`, callback_data: `buy_${p.id}` }]);
+        userBot!.sendMessage(chatId, "اختر المنتج للشراء:", { reply_markup: { inline_keyboard: keyboard } });
+
+      } else if (data?.startsWith("buy_")) {
+        const prodId = data.split("_")[1];
+        const { data: product } = await supabase.from("products").select("*").eq("id", prodId).single();
+        const { data: user } = await supabase.from("users").select("*").eq("telegram_chat_id", chatId).single();
+        if (!user) return userBot!.sendMessage(chatId, "يرجى تسجيل الدخول أولاً.");
+        if (!product) return userBot!.sendMessage(chatId, "المنتج غير موجود.");
+
+        const price = user.is_vip ? product.price * 0.95 : product.price;
+        if (user.balance < price) return userBot!.sendMessage(chatId, `❌ رصيدك غير كافٍ. السعر: ${price.toFixed(2)}$ ورصيدك: ${user.balance.toFixed(2)}$`);
+
+        if (product.requires_input || product.store_type === "quick_order") {
+          const prompt = product.store_type === "quick_order" ? "يرجى إدخال معرف اللاعب (ID):" : "يرجى إدخال البيانات المطلوبة للمنتج:";
+          userStates.set(chatId, { step: "purchase_input", data: { productId: prodId, price, product, user } });
+          userBot!.sendMessage(chatId, prompt);
+        } else {
+          processBotOrder(chatId, user, product, price, {});
+        }
+      }
+    });
+
+    // User bot message handler (state machine)
+    userBot.on("message", async (msg: any) => {
+      const chatId = msg.chat.id;
+      const text = msg.text;
+      const photo = msg.photo;
+
+      // Auto-detect linking code (6 char alphanumeric)
+      if (text && text.length === 6 && /^[A-Z0-9]+$/.test(text.toUpperCase())) {
+        const code = text.toUpperCase();
+        const now = new Date().toISOString();
+        const { data: linkingCode } = await supabase.from("telegram_linking_codes").select("*").eq("code", code).gt("expires_at", now).single();
+        if (linkingCode) {
+          const { data: user } = await supabase.from("users").select("*").eq("id", linkingCode.user_id).single();
+          await supabase.from("users").update({ telegram_chat_id: chatId }).eq("id", linkingCode.user_id);
+          await supabase.from("telegram_linking_codes").delete().eq("id", linkingCode.id);
+          userStates.delete(chatId);
+          userBot!.sendMessage(chatId, "✅ تم تسجيل الدخول بنجاح عبر الكود!");
+          if (user) sendMainMenu(chatId, user, userBot!);
+          return;
+        }
+      }
+
+      // Photo: receipt upload
+      if (photo) {
+        const state = userStates.get(chatId);
+        if (state && state.step === "topup_receipt") {
+          const { data: user } = await supabase.from("users").select("*").eq("telegram_chat_id", chatId).single();
+          if (!user) return;
+          const photoItem = photo[photo.length - 1];
+          userBot!.sendMessage(chatId, "⏳ جاري معالجة الإيصال، يرجى الانتظار...");
+          try {
+            const file = await userBot!.getFile(photoItem.file_id);
+            const fileUrl = `https://api.telegram.org/file/bot${userBotToken}/${file.file_path}`;
+            const fileRes = await fetch(fileUrl);
+            const buffer = await fileRes.arrayBuffer();
+            const base64 = Buffer.from(buffer).toString("base64");
+
+            const imgbbKey = process.env.IMGBB_API_KEY || "5d069b43efb47ed02b0a00a4069f53f9";
+            const imgbbRes = await fetch(`https://api.imgbb.com/1/upload?key=${imgbbKey}`, {
+              method: "POST",
+              body: new URLSearchParams({ image: base64 })
+            });
+            const imgbbData = await imgbbRes.json() as any;
+            if (!imgbbData.success) throw new Error("ImgBB upload failed");
+
+            const receiptUrl = imgbbData.data.url;
+            const { data: method } = await supabase.from("payment_methods").select("name").eq("id", state.data.methodId).single();
+
+            const { data: tx } = await supabase.from("transactions").insert({
+              user_id: user.id,
+              amount: state.data.amount,
+              status: "pending",
+              payment_method_id: state.data.methodId,
+              receipt_image_url: receiptUrl
+            }).select().single();
+
+            const adminChatId = process.env.TELEGRAM_CHAT_ID;
+            if (adminChatId && adminBot && tx) {
+              const adminMsg = `💰 طلب شحن جديد! #TX${tx.id}\n\nالمستخدم: ${user.name}\nالمبلغ: ${state.data.amount}$\nالطريقة: ${method?.name}\n\nرابط الإيصال: ${receiptUrl}`;
+              adminBot.sendMessage(adminChatId, adminMsg, {
+                reply_markup: {
+                  inline_keyboard: [[
+                    { text: "✅ قبول", callback_data: `approve_tx_${tx.id}` },
+                    { text: "❌ رفض", callback_data: `reject_tx_${tx.id}` }
+                  ]]
+                }
+              });
+            }
+
+            userBot!.sendMessage(chatId, "✅ تم إرسال طلب الشحن بنجاح! سيتم مراجعته من قبل الإدارة قريباً.");
+            userStates.delete(chatId);
+          } catch (error) {
+            console.error("Receipt upload error:", error);
+            userBot!.sendMessage(chatId, "❌ حدث خطأ أثناء رفع الإيصال. يرجى المحاولة مرة أخرى.");
+          }
+          return;
+        }
+      }
+
+      if (!text || text.startsWith("/")) return;
+
+      // Persistent keyboard buttons
+      if (text === "💬 الدعم الفني") {
+        const { data: setting } = await supabase.from("settings").select("value").eq("key", "support_whatsapp").single();
+        const link = setting ? `https://wa.me/${setting.value.replace("+", "")}` : "https://t.me/your_support_username";
+        return userBot!.sendMessage(chatId, `يمكنك التواصل مع الدعم الفني عبر الرابط التالي:\n${link}`);
+      } else if (text === "📄 سياسة الخصوصية") {
+        const { data: setting } = await supabase.from("settings").select("value").eq("key", "privacy_policy").single();
+        return userBot!.sendMessage(chatId, `📄 سياسة الخصوصية:\n\n${setting?.value || "لا توجد سياسة حالياً."}`);
+      } else if (text === "🚪 تسجيل الخروج") {
+        await supabase.from("users").update({ telegram_chat_id: null }).eq("telegram_chat_id", chatId);
+        return userBot!.sendMessage(chatId, "👋 تم تسجيل الخروج بنجاح. يمكنك العودة في أي وقت!");
+      }
+
+      const state = userStates.get(chatId);
+      if (!state) return;
+
+      if (state.step === "login_with_code") {
+        const code = text.toUpperCase();
+        const now = new Date().toISOString();
+        const { data: linkingCode } = await supabase.from("telegram_linking_codes").select("*").eq("code", code).gt("expires_at", now).single();
+        if (!linkingCode) {
+          userBot!.sendMessage(chatId, "❌ الكود غير صحيح أو منتهي الصلاحية.");
+          userStates.delete(chatId);
+          return;
+        }
+        const { data: user } = await supabase.from("users").select("*").eq("id", linkingCode.user_id).single();
+        await supabase.from("users").update({ telegram_chat_id: chatId }).eq("id", linkingCode.user_id);
+        await supabase.from("telegram_linking_codes").delete().eq("id", linkingCode.id);
+        userStates.delete(chatId);
+        userBot!.sendMessage(chatId, "✅ تم تسجيل الدخول بنجاح!");
+        if (user) sendMainMenu(chatId, user, userBot!);
+
+      } else if (state.step === "topup_amount") {
+        const amount = parseFloat(text);
+        if (isNaN(amount) || amount <= 0) return userBot!.sendMessage(chatId, "❌ يرجى إدخال مبلغ صحيح:");
+        state.data.amount = amount;
+        state.step = "topup_receipt";
+        userBot!.sendMessage(chatId, "📸 يرجى رفع صورة إيصال التحويل:");
+
+      } else if (state.step === "redeem_voucher_code") {
+        const { data: user } = await supabase.from("users").select("*").eq("telegram_chat_id", chatId).single();
+        if (!user) return userBot!.sendMessage(chatId, "يرجى تسجيل الدخول أولاً.");
+
+        const { data: voucher } = await supabase.from("vouchers").select("*").eq("code", text).eq("active", true).single();
+        if (!voucher) {
+          userBot!.sendMessage(chatId, "❌ كود القسيمة غير صحيح أو غير مفعل.");
+          userStates.delete(chatId);
+          return;
+        }
+
+        const { data: usage } = await supabase.from("voucher_uses").select("id").eq("voucher_id", voucher.id).eq("user_id", user.id).single();
+        if (usage) {
+          userBot!.sendMessage(chatId, "❌ لقد استخدمت هذه القسيمة مسبقاً.");
+          userStates.delete(chatId);
+          return;
+        }
+
+        if (voucher.used_count >= voucher.max_uses) {
+          userBot!.sendMessage(chatId, "❌ هذه القسيمة استُنفذت بالكامل.");
+          userStates.delete(chatId);
+          return;
+        }
+
+        await supabase.from("voucher_uses").insert({ voucher_id: voucher.id, user_id: user.id });
+        await supabase.from("vouchers").update({ used_count: voucher.used_count + 1 }).eq("id", voucher.id);
+        await supabase.rpc("increment_balance", { user_id_param: user.id, amount_param: voucher.amount });
+
+        userBot!.sendMessage(chatId, `✅ تم استرداد القسيمة بنجاح! تم إضافة ${voucher.amount}$ لرصيدك.`);
+        userStates.delete(chatId);
+
+      } else if (state.step === "purchase_input") {
+        const { product, user, price } = state.data;
+        const extraData = product.store_type === "quick_order" ? { playerId: text, storeType: "quick_order" } : { input: text };
+        userStates.delete(chatId);
+        processBotOrder(chatId, user, product, price, extraData);
+
+      } else if (state.step === "login_email") {
+        state.data.email = text;
+        state.step = "login_password";
+        userBot!.sendMessage(chatId, "يرجى إدخال كلمة المرور:");
+
+      } else if (state.step === "login_password") {
+        const { data: user } = await supabase.from("users").select("*").eq("email", state.data.email).single();
+        if (user) {
+          const isMatch = await bcrypt.compare(text, user.password_hash);
+          if (isMatch) {
+            await supabase.from("users").update({ telegram_chat_id: chatId }).eq("id", user.id);
+            userStates.delete(chatId);
+            userBot!.sendMessage(chatId, "✅ تم تسجيل الدخول بنجاح!");
+            sendMainMenu(chatId, user, userBot!);
+            return;
+          }
+        }
+        userBot!.sendMessage(chatId, "❌ البريد الإلكتروني أو كلمة المرور غير صحيحة. حاول مرة أخرى /start");
+        userStates.delete(chatId);
+
+      } else if (state.step === "register_name") {
+        state.data.name = text;
+        state.step = "register_email";
+        userBot!.sendMessage(chatId, "يرجى إدخال البريد الإلكتروني:");
+
+      } else if (state.step === "register_email") {
+        state.data.email = text;
+        state.step = "register_phone";
+        userBot!.sendMessage(chatId, "يرجى إدخال رقم الهاتف:");
+
+      } else if (state.step === "register_phone") {
+        state.data.phone = text;
+        state.step = "register_password";
+        userBot!.sendMessage(chatId, "يرجى إدخال كلمة المرور:");
+
+      } else if (state.step === "register_password") {
+        state.data.password = text;
+        try {
+          let personalNumber = "";
+          while (true) {
+            personalNumber = Math.floor(1000000 + Math.random() * 9000000).toString();
+            const { data: existing } = await supabase.from("users").select("id").eq("personal_number", personalNumber).single();
+            if (!existing) break;
+          }
+
+          let referredById = null;
+          if (state.data.referralCode) {
+            const { data: referrer } = await supabase.from("users").select("id").eq("personal_number", state.data.referralCode).single();
+            if (referrer) referredById = referrer.id;
+          }
+
+          const salt = await bcrypt.genSalt(10);
+          const hashedPassword = await bcrypt.hash(state.data.password, salt);
+
+          const { data: user, error } = await supabase.from("users").insert({
+            name: state.data.name,
+            email: state.data.email,
+            password_hash: hashedPassword,
+            phone: state.data.phone,
+            personal_number: personalNumber,
+            telegram_chat_id: chatId,
+            referred_by_id: referredById
+          }).select().single();
+
+          if (error) throw error;
+          await supabase.from("user_stats").insert({ user_id: user.id });
+
+          userStates.delete(chatId);
+          userBot!.sendMessage(chatId, "✅ تم إنشاء الحساب بنجاح!");
+          sendMainMenu(chatId, user, userBot!);
+        } catch (e) {
+          console.error(e);
+          userBot!.sendMessage(chatId, "❌ حدث خطأ (ربما البريد مستخدم مسبقاً). حاول مرة أخرى /start");
+          userStates.delete(chatId);
+        }
+      }
+    });
+
+  } catch (e) {
+    console.error("Failed to start User Bot:", e);
+  }
+}
+
+startServer();
