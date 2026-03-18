@@ -1665,7 +1665,7 @@ export default function App() {
               <label className="text-sm font-bold text-gray-700">الكمية المطلوبة (أقل كمية {prod.min_quantity})</label>
               <input 
                 type="number" 
-                value={quantity || ""}
+                value={quantity}
                 onChange={(e) => setQuantity(Math.max(1, parseInt(e.target.value) || 1))}
                 className={`w-full bg-gray-50 border border-gray-100 rounded-xl px-4 py-3 outline-none focus:${theme.border} transition-colors`}
               />
