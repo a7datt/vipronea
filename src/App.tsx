@@ -1903,7 +1903,7 @@ export default function App() {
                 </div>
                 <div className="space-y-4">
                   <div className="space-y-2">
-                    <label className="text-sm font-bold text-gray-700">المبلغ بالدولار</label>
+                    <label className="text-sm font-bold text-gray-700"></label>المبلغ $/ل.س</label>
                     <input type="number" value={amount} onChange={e => setAmount(e.target.value)} placeholder="0.00"
                       className="w-full bg-gray-50 border border-gray-100 rounded-xl px-4 py-3 outline-none focus:border-brand" />
                   </div>
