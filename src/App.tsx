@@ -1591,7 +1591,7 @@ export default function App() {
     const prod = view.data;
     const [extraData, setExtraData] = useState("");
     const [quantity, setQuantity] = useState<number>(
-      prod.store_type === 'quantities' ? (parseInt(String(prod.min_quantity)) || 0) : 1
+      prod.store_type === 'quantities' ? (parseInt(String(prod.min_quantity)) || 1) : 1
     );
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState("");
