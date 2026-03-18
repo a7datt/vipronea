@@ -1890,7 +1890,8 @@ export default function App() {
               <>
                 <div className="bg-green-50 p-4 rounded-xl border border-green-100 text-center space-y-1">
                   <p className="text-green-700 font-bold text-sm">✅ شحن تلقائي فوري</p>
-                  <p className="text-green-600 text-xs">يتم التحقق من العملية تلقائياً وإضافة الرصيد فوراً</p>
+                  <p className="text-green-600 text-xs">يتم التحقق من العملية تلقائياً وإضافة الرصيد فوراً 
+1$ لكل 120 ل.س جديدة</p>
                 </div>
                 <div className="bg-brand-light p-4 rounded-xl border border-brand-soft text-center">
                   <p className="text-brand text-xs mb-1">
