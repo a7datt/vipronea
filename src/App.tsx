@@ -1383,7 +1383,7 @@ export default function App() {
                       <h4 className="font-bold text-gray-800">{prod.name}</h4>
                       <p className={`${theme.text} font-bold`}>
                         {prod.store_type === 'quantities'
-                          ? `${(parseFloat(prod.price_per_unit as any) || 0).toFixed(4)} $ / وحدة`
+                          ? `${(parseFloat(prod.price_per_unit as any) || 0).toFixed(6)} $ / وحدة`
                           : `${(parseFloat(prod.price as any) || 0).toFixed(2)} $`}
                       </p>
                     </div>
@@ -1461,7 +1461,7 @@ export default function App() {
                   <h4 className="font-bold text-gray-800">{prod.name}</h4>
                   <p className={`${theme.text} font-bold`}>
                     {prod.store_type === 'quantities'
-                      ? `${(parseFloat(prod.price_per_unit) || 0).toFixed(4)} $ / وحدة`
+                      ? `${(parseFloat(prod.price_per_unit) || 0).toFixed(6)} $ / وحدة`
                       : `${(parseFloat(prod.price) || 0).toFixed(2)} $`}
                   </p>
                 </div>
@@ -1702,7 +1702,7 @@ export default function App() {
             <div className="flex justify-between text-sm">
               <span className="text-gray-500">سعر الوحدة</span>
               <span className="font-bold">
-                {prod.store_type === 'quantities' ? unitPrice.toFixed(4) : unitPrice.toFixed(2)} $
+                {prod.store_type === 'quantities' ? unitPrice.toFixed(6) : unitPrice.toFixed(2)} $
               </span>
             </div>
             <div className="flex justify-between text-sm">
@@ -4512,7 +4512,7 @@ const AdminPanel = ({
                           <div className="space-y-2 p-3 bg-gray-50 rounded-xl">
                             <p className="text-xs font-bold text-gray-500">إعدادات الكميات</p>
                             <input type="number" placeholder="أقل كمية" className="w-full p-2 bg-white rounded-lg text-sm outline-none" value={editingItem.min_quantity || ""} onChange={e => setEditingItem({...editingItem, min_quantity: e.target.value})} />
-                            <input type="number" step="0.0001" placeholder="سعر الوحدة الواحدة" className="w-full p-2 bg-white rounded-lg text-sm outline-none" value={editingItem.price_per_unit || ""} onChange={e => setEditingItem({...editingItem, price_per_unit: e.target.value})} />
+                            <input type="number" step="0.000001" placeholder="سعر الوحدة الواحدة" className="w-full p-2 bg-white rounded-lg text-sm outline-none" value={editingItem.price_per_unit || ""} onChange={e => setEditingItem({...editingItem, price_per_unit: e.target.value})} />
                           </div>
                         ) : (
                           <input type="number" step="0.01" placeholder="السعر $" className="w-full p-3 bg-gray-50 rounded-xl text-sm outline-none" value={editingItem.price || ""} onChange={e => setEditingItem({...editingItem, price: e.target.value})} />
@@ -4662,7 +4662,7 @@ const AdminPanel = ({
                           <div className="space-y-2 p-3 bg-gray-50 rounded-xl border border-gray-100">
                             <p className="text-xs font-bold text-gray-500">إعدادات الكميات</p>
                             <input type="number" placeholder="أقل كمية" className="w-full p-2 bg-white rounded-lg text-sm outline-none" value={newProduct.min_quantity} onChange={e => setNewProduct({...newProduct, min_quantity: e.target.value})} />
-                            <input type="number" step="0.0001" placeholder="سعر الوحدة الواحدة (مثال: 0.001)" className="w-full p-2 bg-white rounded-lg text-sm outline-none" value={newProduct.price_per_unit} onChange={e => setNewProduct({...newProduct, price_per_unit: e.target.value})} />
+                            <input type="number" step="0.000001" placeholder="سعر الوحدة الواحدة (مثال: 0.001)" className="w-full p-2 bg-white rounded-lg text-sm outline-none" value={newProduct.price_per_unit} onChange={e => setNewProduct({...newProduct, price_per_unit: e.target.value})} />
                           </div>
                         ) : (
                           <input type="number" step="0.01" placeholder="السعر $" className="w-full p-3 bg-gray-50 rounded-xl text-sm outline-none" value={newProduct.price} onChange={e => setNewProduct({...newProduct, price: e.target.value})} />
@@ -5046,7 +5046,7 @@ const AdminPanel = ({
                         <div className="space-y-2 p-3 bg-gray-50 rounded-xl border border-gray-100">
                           <p className="text-xs font-bold text-gray-500">إعدادات الكميات</p>
                           <input type="number" placeholder="أقل كمية" className="w-full p-2 bg-white rounded-lg text-sm outline-none" value={newProduct.min_quantity} onChange={e => setNewProduct({...newProduct, min_quantity: e.target.value})} />
-                          <input type="number" step="0.0001" placeholder="سعر الوحدة الواحدة (مثال: 0.001)" className="w-full p-2 bg-white rounded-lg text-sm outline-none" value={newProduct.price_per_unit} onChange={e => setNewProduct({...newProduct, price_per_unit: e.target.value})} />
+                          <input type="number" step="0.000001" placeholder="سعر الوحدة الواحدة (مثال: 0.001)" className="w-full p-2 bg-white rounded-lg text-sm outline-none" value={newProduct.price_per_unit} onChange={e => setNewProduct({...newProduct, price_per_unit: e.target.value})} />
                         </div>
                       ) : (
                         <input type="number" step="0.01" placeholder="السعر $" className="w-full p-3 bg-gray-50 rounded-xl text-sm outline-none" value={newProduct.price} onChange={e => setNewProduct({...newProduct, price: e.target.value})} />
