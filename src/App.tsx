@@ -1891,7 +1891,7 @@ export default function App() {
                 <div className="bg-green-50 p-4 rounded-xl border border-green-100 text-center space-y-1">
                   <p className="text-green-700 font-bold text-sm">✅ شحن تلقائي فوري</p>
                   <p className="text-green-600 text-xs">يتم التحقق من العملية تلقائياً وإضافة الرصيد فوراً 
-1$ لكل 120 ل.س جديدة</p>
+في حال كانت العملية بالليرة السورية سيتم تعبئة رصيد بـ1$ لكل 120 ل.س جديدو</p>
                 </div>
                 <div className="bg-brand-light p-4 rounded-xl border border-brand-soft text-center">
                   <p className="text-brand text-xs mb-1">
@@ -1904,7 +1904,7 @@ export default function App() {
                 </div>
                 <div className="space-y-4">
                   <div className="space-y-2">
-                    <label className="text-sm font-bold text-gray-700">المبلغ $/ل.س</label>
+                    <label className="text-sm font-bold text-gray-700">اكتب قيمة المبلغ المرسل ان كان $ او ل.س </label>
                     <input type="number" value={amount} onChange={e => setAmount(e.target.value)} placeholder="0.00"
                       className="w-full bg-gray-50 border border-gray-100 rounded-xl px-4 py-3 outline-none focus:border-brand" />
                   </div>
