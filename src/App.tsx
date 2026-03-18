@@ -1591,7 +1591,7 @@ export default function App() {
     const prod = view.data;
     const [extraData, setExtraData] = useState("");
     const [quantity, setQuantity] = useState<number>(
-      prod.store_type === 'quantities' ? (parseInt(String(prod.min_quantity)) || 1) : 1
+      prod.store_type === 'quantities' ? (parseInt(String(prod.min_quantity)) || 0) : 1
     );
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState("");
@@ -1666,7 +1666,7 @@ export default function App() {
               <input 
                 type="number" 
                 value={quantity || ""}
-                onChange={(e) => setQuantity(parseInt(e.target.value) || 0)}
+                onChange={(e) => setQuantity(Math.max(1, parseInt(e.target.value) || 1))}
                 className={`w-full bg-gray-50 border border-gray-100 rounded-xl px-4 py-3 outline-none focus:${theme.border} transition-colors`}
               />
             </div>
