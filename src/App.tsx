@@ -1665,8 +1665,8 @@ export default function App() {
               <label className="text-sm font-bold text-gray-700">الكمية المطلوبة (أقل كمية {prod.min_quantity})</label>
               <input 
                 type="number" 
-                value={quantity}
-                onChange={(e) => setQuantity(Math.max(1, parseInt(e.target.value) || 1))}
+                value={quantity || ""}
+                onChange={(e) => setQuantity(parseInt(e.target.value) || 0)}
                 className={`w-full bg-gray-50 border border-gray-100 rounded-xl px-4 py-3 outline-none focus:${theme.border} transition-colors`}
               />
             </div>
@@ -5138,7 +5138,7 @@ const AdminPanel = ({
                     {view.type === "subcategories" && <SubcategoriesView />}
                     {view.type === "sub_sub_categories" && <SubSubCategoriesView />}
                     {view.type === "products" && <ProductsView />}
-                    {view.type === "checkout" && CheckoutView()}
+                    {view.type === "checkout" && <CheckoutView />}
                     {view.type === "quick_order" && <QuickOrderView />}
                     {view.type === "success" && <SuccessView />}
                     {view.type === "login" && <LoginView />}
